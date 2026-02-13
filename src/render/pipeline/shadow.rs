@@ -1,0 +1,329 @@
+//! Shadow tracing compute pipeline
+
+use bytemuck::{Pod, Zeroable};
+use crate::render::buffer::{OctreeBuffer, CameraBuffer};
+
+/// Shadow tracing parameters
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct ShadowParams {
+    pub light_dir: [f32; 3],
+    pub _pad1: f32,
+    pub shadow_bias: f32,
+    pub soft_shadow_samples: u32,
+    pub soft_shadow_angle: f32,
+    pub chunk_count: u32,
+    pub width: u32,
+    pub height: u32,
+    pub leaf_opacity: f32,
+    pub _pad2: f32,
+    // Chunk grid acceleration (same layout as TraceParams grid fields)
+    pub grid_min_x: i32,
+    pub grid_min_y: i32,
+    pub grid_min_z: i32,
+    pub chunk_size: f32,
+    pub grid_size_x: u32,
+    pub grid_size_y: u32,
+    pub grid_size_z: u32,
+    pub _pad3: u32,
+}
+
+impl Default for ShadowParams {
+    fn default() -> Self {
+        let dir = glam::Vec3::new(0.5, 1.0, 0.3).normalize();
+        Self {
+            light_dir: dir.to_array(),
+            _pad1: 0.0,
+            shadow_bias: 0.01,
+            soft_shadow_samples: 4,
+            soft_shadow_angle: 0.06, // ~3.5 degrees for dappled light
+            chunk_count: 1,
+            width: 1280,
+            height: 720,
+            leaf_opacity: 0.15, // Light per-brick; accumulates over many hits
+            _pad2: 0.0,
+            grid_min_x: 0,
+            grid_min_y: 0,
+            grid_min_z: 0,
+            chunk_size: 4.0,
+            grid_size_x: 1,
+            grid_size_y: 1,
+            grid_size_z: 1,
+            _pad3: 0,
+        }
+    }
+}
+
+/// Shadow tracing compute pipeline
+///
+/// Takes G-buffer depth and normal as input, performs SVO shadow ray tracing
+/// from surface points towards the light source, and outputs a shadow mask.
+pub struct ShadowPipeline {
+    pipeline: wgpu::ComputePipeline,
+    params_buffer: wgpu::Buffer,
+    #[allow(dead_code)]
+    camera_params_bind_group_layout: wgpu::BindGroupLayout,
+    camera_params_bind_group: wgpu::BindGroup,
+    gbuffer_bind_group_layout: wgpu::BindGroupLayout,
+    output_bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl ShadowPipeline {
+    /// Create a new shadow tracing pipeline
+    ///
+    /// # Arguments
+    /// * `device` - WGPU device
+    /// * `camera_buffer` - Camera uniform buffer (provides view-projection matrix)
+    /// * `octree_buffer` - SVO octree buffer (provides scene geometry)
+    pub fn new(
+        device: &wgpu::Device,
+        camera_buffer: &CameraBuffer,
+        octree_buffer: &OctreeBuffer,
+    ) -> Self {
+        // Load shader
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shadow_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../../shaders/shadow.wgsl").into()),
+        });
+
+        // Create params buffer
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow_params"),
+            size: std::mem::size_of::<ShadowParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Bind group 0: Camera + Shadow params
+        let camera_params_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shadow_camera_params_layout"),
+                entries: &[
+                    // Camera buffer
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Shadow params
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let camera_params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow_camera_params_bind_group"),
+            layout: &camera_params_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Bind group 2: G-buffer input textures (depth + normal + material)
+        let gbuffer_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shadow_gbuffer_layout"),
+                entries: &[
+                    // Depth texture (R32Float)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // Normal texture (RGBA16Float)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // Material texture (RGBA8Unorm)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        // Bind group 3: Output shadow mask texture
+        let output_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shadow_output_layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                }],
+            });
+
+        // Create pipeline layout
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow_pipeline_layout"),
+            bind_group_layouts: &[
+                &camera_params_bind_group_layout,
+                octree_buffer.bind_group_layout(),
+                &gbuffer_bind_group_layout,
+                &output_bind_group_layout,
+            ],
+            immediate_size: 0,
+        });
+
+        // Create compute pipeline
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("shadow_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        Self {
+            pipeline,
+            params_buffer,
+            camera_params_bind_group_layout,
+            camera_params_bind_group,
+            gbuffer_bind_group_layout,
+            output_bind_group_layout,
+        }
+    }
+
+    /// Create G-buffer bind group for input textures (depth, normal, and material)
+    ///
+    /// # Arguments
+    /// * `device` - WGPU device
+    /// * `depth_view` - Depth texture view (linear depth from G-buffer)
+    /// * `normal_view` - Normal texture view (world-space normals from G-buffer)
+    /// * `material_view` - Material texture view (PBR material properties from G-buffer)
+    pub fn create_gbuffer_bind_group(
+        &self,
+        device: &wgpu::Device,
+        depth_view: &wgpu::TextureView,
+        normal_view: &wgpu::TextureView,
+        material_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow_gbuffer_bind_group"),
+            layout: &self.gbuffer_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(material_view),
+                },
+            ],
+        })
+    }
+
+    /// Create output bind group for the shadow mask texture
+    ///
+    /// # Arguments
+    /// * `device` - WGPU device
+    /// * `shadow_view` - Shadow mask texture view (R8Unorm storage texture)
+    pub fn create_output_bind_group(
+        &self,
+        device: &wgpu::Device,
+        shadow_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow_output_bind_group"),
+            layout: &self.output_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(shadow_view),
+            }],
+        })
+    }
+
+    /// Update shadow parameters (light direction, bias, soft shadow settings)
+    ///
+    /// # Arguments
+    /// * `queue` - WGPU queue
+    /// * `params` - New shadow tracing parameters
+    pub fn update_params(&self, queue: &wgpu::Queue, params: &ShadowParams) {
+        queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
+    }
+
+    /// Dispatch the shadow tracing compute shader
+    ///
+    /// # Arguments
+    /// * `encoder` - Command encoder
+    /// * `octree_buffer` - SVO octree buffer (scene geometry)
+    /// * `gbuffer_bind_group` - G-buffer input bind group (depth + normal)
+    /// * `output_bind_group` - Shadow mask output bind group
+    /// * `width` - Output width in pixels
+    /// * `height` - Output height in pixels
+    pub fn dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        octree_buffer: &OctreeBuffer,
+        gbuffer_bind_group: &wgpu::BindGroup,
+        output_bind_group: &wgpu::BindGroup,
+        width: u32,
+        height: u32,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("shadow_pass"),
+            timestamp_writes,
+        });
+
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.camera_params_bind_group, &[]);
+        pass.set_bind_group(1, octree_buffer.bind_group(), &[]);
+        pass.set_bind_group(2, gbuffer_bind_group, &[]);
+        pass.set_bind_group(3, output_bind_group, &[]);
+
+        // Dispatch with 8x8 workgroups (matching the shader's @workgroup_size)
+        let workgroups_x = (width + 7) / 8;
+        let workgroups_y = (height + 7) / 8;
+        pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+    }
+}

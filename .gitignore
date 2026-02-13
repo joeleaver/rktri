@@ -1,0 +1,30 @@
+# Build artifacts
+/target/
+
+# Generated assets (worlds, pre-baked trees)
+/assets/worlds/
+/assets/trees/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Claude Code / OMC state (session-specific)
+.claude/
+.omc/
+
+# MCP config (contains local paths)
+.mcp.json
+
+# DLSS local patched crate (separate git repo, add as submodule later)
+/dlss_wgpu_local/
+
+# DLSS SDK binaries (not redistributable)
+*.so
+*.so.*
+*.dll
