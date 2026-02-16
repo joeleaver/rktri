@@ -28,7 +28,7 @@ use rktri::atmosphere::{AtmosphereSystem, AtmosphereConfig};
 use rktri::grass::{GrassSystem, GrassConfig};
 use rktri::grass::GrassCell;
 use rktri::mask::MaskOctree;
-use rktri::scene::{SceneConfig, SceneManager};
+use rktri::scene::SceneConfig;
 use rktri::voxel::StreamingManager;
 use rktri::streaming::disk_io;
 use std::path::PathBuf;
@@ -109,16 +109,10 @@ struct RenderResources {
 }
 
 impl RenderResources {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: wgpu::TextureFormat, width: u32, height: u32, render_scale: f32, scene_manager: &mut SceneManager, world_path: Option<&PathBuf>) -> Self {
-        use rktri::voxel::svo::svdag::SvdagBuilder;
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: wgpu::TextureFormat, width: u32, height: u32, render_scale: f32, world_path: &PathBuf) -> Self {
         use rktri::voxel::chunk::CHUNK_SIZE;
 
-        // Collect compressed octrees with world positions via two paths:
-        // 1. Disk-loading: pre-generated world files → (ChunkCoord, Octree) tuples
-        // 2. Scene graph: generate_chunks_around() → flatten() → FlatChunkEntry
-        //
-        // Both paths converge on SVDAG compression + upload_chunk_incremental().
-
+        // Only path: load pre-generated v3 world from disk (SVDAG pre-compressed)
         struct CompressedEntry {
             world_min: [f32; 3],
             root_size: f32,
@@ -126,74 +120,21 @@ impl RenderResources {
             octree: rktri::voxel::svo::Octree,
         }
 
-        let compressed_entries: Vec<CompressedEntry> = if let Some(path) = world_path {
-            // Disk-loading path (pre-generated worlds)
-            log::info!("Loading pre-generated world from: {}", path.display());
-            let (chunks, version) = Self::load_chunks_from_disk(path);
-            log::info!("World format version: {}", version);
+        log::info!("Loading pre-generated v3 world from: {}", world_path.display());
+        let chunks = Self::load_chunks_from_disk(world_path);
 
-            // For v3 worlds, chunks are already SVDAG-compressed - use directly
-            // For v2 and earlier, apply compression now (backward compatibility)
-            let needs_svdag = version < 3;
-
-            chunks.iter().map(|(coord, octree)| {
-                let octree_to_use = if needs_svdag {
-                    let raw_nodes = octree.node_count();
-                    let pruned = octree.prune();
-                    let pruned_nodes = pruned.node_count();
-                    let before_bricks = pruned.brick_count();
-                    let compressed = SvdagBuilder::new().build(&pruned);
-                    log::info!("Chunk ({},{},{}): prune {} -> {} nodes, SVDAG {} -> {} bricks ({:.0}x dedup)",
-                        coord.x, coord.y, coord.z,
-                        raw_nodes, pruned_nodes,
-                        before_bricks, compressed.brick_count(),
-                        if compressed.brick_count() > 0 { before_bricks as f64 / compressed.brick_count() as f64 } else { 0.0 });
-                    compressed
-                } else {
-                    // v3: already SVDAG-compressed on disk
-                    log::info!("Chunk ({},{},{}): v3 pre-compressed, {} nodes, {} bricks",
-                        coord.x, coord.y, coord.z,
-                        octree.node_count(), octree.brick_count());
-                    octree.clone()
-                };
-                CompressedEntry {
-                    world_min: [
-                        coord.x as f32 * CHUNK_SIZE as f32,
-                        coord.y as f32 * CHUNK_SIZE as f32,
-                        coord.z as f32 * CHUNK_SIZE as f32,
-                    ],
-                    root_size: octree_to_use.root_size(),
-                    layer_id: 0, // TERRAIN
-                    octree: octree_to_use,
-                }
-            }).collect()
-        } else {
-            // Scene graph path: flatten gives us FlatChunkEntry with layer metadata
-            let config = scene_manager.config().clone();
-            scene_manager.generate_chunks_around(config.initial_camera_pos, config.view_distance);
-            let flat_entries = scene_manager.flatten();
-            flat_entries.iter().filter(|entry| {
-                // Skip empty entries — no geometry to render
-                entry.octree.brick_count() > 0
-            }).map(|entry| {
-                let raw_nodes = entry.octree.node_count();
-                let pruned = entry.octree.prune();
-                let pruned_nodes = pruned.node_count();
-                let before_bricks = pruned.brick_count();
-                let compressed = SvdagBuilder::new().build(&pruned);
-                log::info!("FlatEntry ({:?} layer={}): prune {} -> {} nodes, SVDAG {} -> {} bricks ({:.0}x dedup)",
-                    entry.coord, entry.layer_id.0,
-                    raw_nodes, pruned_nodes,
-                    before_bricks, compressed.brick_count(),
-                    if compressed.brick_count() > 0 { before_bricks as f64 / compressed.brick_count() as f64 } else { 0.0 });
-                CompressedEntry {
-                    world_min: entry.world_min.into(),
-                    root_size: entry.root_size,
-                    layer_id: entry.layer_id.0,
-                    octree: compressed,
-                }
-            }).collect()
-        };
+        let compressed_entries: Vec<CompressedEntry> = chunks.iter().map(|(coord, octree)| {
+            CompressedEntry {
+                world_min: [
+                    coord.x as f32 * CHUNK_SIZE as f32,
+                    coord.y as f32 * CHUNK_SIZE as f32,
+                    coord.z as f32 * CHUNK_SIZE as f32,
+                ],
+                root_size: octree.root_size(),
+                layer_id: 0, // TERRAIN
+                octree: octree.clone(),
+            }
+        }).collect();
 
         // Sum up total nodes/bricks for buffer allocation
         let mut total_nodes = 0usize;
@@ -246,27 +187,25 @@ impl RenderResources {
             grid_size[0] as usize * grid_size[1] as usize * grid_size[2] as usize);
 
         // Load and upload grass masks
-        if let Some(path) = world_path {
-            let grass_masks_map = Self::load_grass_masks_from_disk(path);
-            if !grass_masks_map.is_empty() {
-                // Build per-chunk mask array matching compressed_entries order
-                let chunk_size_i = rktri::voxel::chunk::CHUNK_SIZE as f32;
-                let masks_ordered: Vec<Option<&MaskOctree<GrassCell>>> = compressed_entries.iter()
-                    .map(|entry| {
-                        let cx = (entry.world_min[0] / chunk_size_i).round() as i32;
-                        let cy = (entry.world_min[1] / chunk_size_i).round() as i32;
-                        let cz = (entry.world_min[2] / chunk_size_i).round() as i32;
-                        grass_masks_map.get(&(cx, cy, cz))
-                    })
-                    .collect();
-                let matched = masks_ordered.iter().filter(|m| m.is_some()).count();
-                log::info!("Grass masks: {} loaded, {} matched to chunks", grass_masks_map.len(), matched);
+        let grass_masks_map = Self::load_grass_masks_from_disk(world_path);
+        if !grass_masks_map.is_empty() {
+            // Build per-chunk mask array matching compressed_entries order
+            let chunk_size_i = rktri::voxel::chunk::CHUNK_SIZE as f32;
+            let masks_ordered: Vec<Option<&MaskOctree<GrassCell>>> = compressed_entries.iter()
+                .map(|entry| {
+                    let cx = (entry.world_min[0] / chunk_size_i).round() as i32;
+                    let cy = (entry.world_min[1] / chunk_size_i).round() as i32;
+                    let cz = (entry.world_min[2] / chunk_size_i).round() as i32;
+                    grass_masks_map.get(&(cx, cy, cz))
+                })
+                .collect();
+            let matched = masks_ordered.iter().filter(|m| m.is_some()).count();
+            log::info!("Grass masks: {} loaded, {} matched to chunks", grass_masks_map.len(), matched);
 
-                // Pack masks to GPU format and upload
-                let (infos, nodes, values) = rktri::render::buffer::pack_grass_masks(&masks_ordered);
+            // Pack masks to GPU format and upload
+            let (infos, nodes, values) = rktri::render::buffer::pack_grass_masks(&masks_ordered);
 
-                octree_buffer.upload_grass_masks(device, queue, &infos, &nodes, &values);
-            }
+            octree_buffer.upload_grass_masks(device, queue, &infos, &nodes, &values);
         }
 
         // Store chunk bounds for terrain height queries
@@ -887,16 +826,15 @@ impl RenderResources {
         }
     }
 
-    /// Load individual chunk octrees from disk (no merging)
-    /// Returns (chunks, version) where version is the manifest format version
-    fn load_chunks_from_disk(world_path: &PathBuf) -> (Vec<(disk_io::ChunkCoord, rktri::voxel::svo::Octree)>, u32) {
+    /// Load individual chunk octrees from disk (v3 format only - SVDAG pre-compressed)
+    fn load_chunks_from_disk(world_path: &PathBuf) -> Vec<(disk_io::ChunkCoord, rktri::voxel::svo::Octree)> {
         use serde_json::Value;
 
         let manifest_path = world_path.join("manifest.json");
         if !manifest_path.exists() {
             log::error!("Manifest file not found: {}", manifest_path.display());
-            log::info!("Generate a world first with: cargo run --release --bin generate_world");
-            return (vec![], 1);
+            log::info!("Generate a world first with: cargo run --release --bin generate_world -- --size <N> --name <name>");
+            std::process::exit(1);
         }
 
         log::info!("Reading manifest from: {}", manifest_path.display());
@@ -905,51 +843,33 @@ impl RenderResources {
         let manifest: Value = serde_json::from_str(&manifest_data)
             .expect("Failed to parse manifest JSON");
 
-        let version = manifest["version"].as_u64().unwrap_or(1);
+        let version = manifest["version"].as_u64().unwrap_or(3);
+        if version != 3 {
+            log::error!("Only v3 world format is supported. Found version {}. Please regenerate the world.", version);
+            std::process::exit(1);
+        }
         log::info!("Manifest version: {}", version);
 
         let mut result = Vec::new();
 
-        if version >= 2 {
-            // V2: layer-based format — chunks stored under <layer_dir>/chunk_x_y_z.rkc
-            let layers = manifest["layers"].as_array()
-                .expect("V2 manifest missing 'layers' array");
+        // V3: layer-based format — chunks stored under <layer_dir>/chunk_x_y_z.rkc
+        let layers = manifest["layers"].as_array()
+            .expect("V3 manifest missing 'layers' array");
 
-            for layer in layers {
-                let layer_name = layer["name"].as_str().unwrap_or("unknown");
-                let layer_dir = layer["directory"].as_str().unwrap_or(layer_name);
+        for layer in layers {
+            let layer_name = layer["name"].as_str().unwrap_or("unknown");
+            let layer_dir = layer["directory"].as_str().unwrap_or(layer_name);
 
-                // Skip non-terrain layers (e.g. grass masks are loaded separately)
-                let chunk_list = match layer["chunks"].as_array() {
-                    Some(list) => list,
-                    None => {
-                        log::info!("Skipping layer '{}' (no chunks array)", layer_name);
-                        continue;
-                    }
-                };
-
-                log::info!("Loading layer '{}': {} chunks", layer_name, chunk_list.len());
-
-                for chunk_info in chunk_list {
-                    let x = chunk_info["x"].as_i64().unwrap() as i32;
-                    let y = chunk_info["y"].as_i64().unwrap() as i32;
-                    let z = chunk_info["z"].as_i64().unwrap() as i32;
-
-                    let chunk_file = world_path
-                        .join(layer_dir)
-                        .join(format!("chunk_{}_{}_{}.rkc", x, y, z));
-
-                    if let Some(chunk) = Self::load_chunk_file(&chunk_file, x, y, z, version as u32) {
-                        result.push(chunk);
-                    }
+            // Skip non-terrain layers (e.g. grass masks are loaded separately)
+            let chunk_list = match layer["chunks"].as_array() {
+                Some(list) => list,
+                None => {
+                    log::info!("Skipping layer '{}' (no chunks array)", layer_name);
+                    continue;
                 }
-            }
-        } else {
-            // V1: flat format — chunks stored under y_<y>/chunk_x_y_z.rkc
-            let chunk_list = manifest["chunks"].as_array()
-                .expect("Manifest missing 'chunks' array");
+            };
 
-            log::info!("Found {} chunks in manifest (v1 format)", chunk_list.len());
+            log::info!("Loading layer '{}': {} chunks", layer_name, chunk_list.len());
 
             for chunk_info in chunk_list {
                 let x = chunk_info["x"].as_i64().unwrap() as i32;
@@ -957,20 +877,20 @@ impl RenderResources {
                 let z = chunk_info["z"].as_i64().unwrap() as i32;
 
                 let chunk_file = world_path
-                    .join(format!("y_{}", y))
+                    .join(layer_dir)
                     .join(format!("chunk_{}_{}_{}.rkc", x, y, z));
 
-                if let Some(chunk) = Self::load_chunk_file(&chunk_file, x, y, z, version as u32) {
+                if let Some(chunk) = Self::load_chunk_file(&chunk_file, x, y, z) {
                     result.push(chunk);
                 }
             }
         }
 
         log::info!("Loaded {} chunks total", result.len());
-        (result, version as u32)
+        result
     }
 
-    fn load_chunk_file(path: &std::path::Path, x: i32, y: i32, z: i32, world_version: u32)
+    fn load_chunk_file(path: &std::path::Path, x: i32, y: i32, z: i32)
         -> Option<(disk_io::ChunkCoord, rktri::voxel::svo::Octree)>
     {
         if !path.exists() {
@@ -981,15 +901,9 @@ impl RenderResources {
         let compressed = std::fs::read(path)
             .expect(&format!("Failed to read chunk file: {}", path.display()));
 
-        let chunk = if world_version >= 3 {
-            // v3: SVDAG pre-compressed on disk
-            disk_io::decompress_svdag_chunk(&compressed)
-                .expect(&format!("Failed to decompress SVDAG chunk: {}", path.display()))
-        } else {
-            // v2 and earlier: apply compression at load time
-            disk_io::decompress_chunk(&compressed)
-                .expect(&format!("Failed to decompress chunk: {}", path.display()))
-        };
+        // v3: SVDAG pre-compressed on disk
+        let chunk = disk_io::decompress_svdag_chunk(&compressed)
+            .expect(&format!("Failed to decompress SVDAG chunk: {}", path.display()));
 
         log::info!("Loaded chunk ({},{},{}): {} nodes, {} bricks",
             x, y, z, chunk.octree.node_count(), chunk.octree.brick_count());
@@ -1622,7 +1536,6 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
     resources: Option<RenderResources>,
-    scene_manager: SceneManager,
     camera: Camera,
     controller: FpsCameraController,
     input: InputState,
@@ -1658,7 +1571,6 @@ impl App {
             window: None,
             gpu: None,
             resources: None,
-            scene_manager: SceneManager::new(config.clone()),
             camera: Camera::look_at(initial_pos, target, glam::Vec3::Y),
             controller: FpsCameraController::new(2.0, 0.5),  // Slower for small world
             input: InputState::new(),
@@ -2603,10 +2515,9 @@ impl ApplicationHandler for App {
         log::info!("Window created: {}x{}", size.width, size.height);
         log::info!("GPU: {}", gpu.adapter.get_info().name);
 
-        // Create render resources with scene manager (or load from disk)
-        // mut needed when dlss feature calls init_dlss
-        #[allow(unused_mut)]
-        let mut resources = RenderResources::new(&gpu.device, &gpu.queue, gpu.format(), size.width, size.height, self.render_scale, &mut self.scene_manager, self.world_path.as_ref());
+        // Create render resources - requires pre-generated v3 world
+        let world_path = self.world_path.clone().expect("No world specified. Generate one with: cargo run --release --bin generate_world -- --size <N> --name <name>");
+        let resources = RenderResources::new(&gpu.device, &gpu.queue, gpu.format(), size.width, size.height, self.render_scale, &world_path);
 
         #[cfg(feature = "dlss")]
         {

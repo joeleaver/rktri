@@ -143,7 +143,7 @@ fn main() {
                 return None;
             }
 
-            // Write terrain chunk with SVDAG pre-compression
+            // Write terrain chunk with SVDAG pre-compression (v3 format)
             let disk_coord = disk_io::ChunkCoord::new(coord.x, coord.y, coord.z);
 
             // Apply SVDAG compression ONCE during world generation
@@ -151,8 +151,9 @@ fn main() {
             let svdag = SvdagBuilder::new().build(&pruned);
 
             let disk_chunk = disk_io::Chunk::from_octree(disk_coord, svdag);
-            let compressed = disk_io::compress_chunk(&disk_chunk)
-                .expect("Failed to compress chunk");
+            let compressed = disk_io::serialize_svdag_chunk(&disk_chunk)
+                .expect("Failed to serialize SVDAG chunk");
+            let compressed = lz4_flex::compress_prepend_size(&compressed);
 
             let chunk_file = terrain_dir.join(format!("chunk_{}_{}_{}.rkc", coord.x, coord.y, coord.z));
             total_terrain_bytes.fetch_add(compressed.len(), Ordering::Relaxed);
