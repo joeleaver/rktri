@@ -4,38 +4,44 @@
 //! 1. Biome mask construction (MaskOctree<BiomeId>)
 //! 2. Terrain octree building (via MaskDrivenTerrainClassifier)
 //! 3. Grass mask construction (MaskOctree<GrassCell>)
+//! 4. Rock mask construction (MaskOctree<RockCell>)
 
 pub mod config;
 pub mod biome_gen;
 pub mod terrain_gen;
 pub mod grass_gen;
+pub mod rock_gen;
 
 pub use config::GenerationConfig;
 pub use biome_gen::BiomeNoiseGenerator;
 pub use terrain_gen::MaskDrivenTerrainClassifier;
 pub use grass_gen::GrassNoiseGenerator;
+pub use crate::grass::profile::GrassCell;
+pub use rock_gen::{RockNoiseGenerator, RockCell};
 
 use glam::Vec3;
 use rayon::prelude::*;
-use crate::grass::profile::{GrassCell, GrassProfileTable};
+use crate::grass::profile::GrassProfileTable;
 use crate::mask::{MaskBuilder, MaskOctree};
 use crate::terrain::biome::BiomeMap;
 use crate::terrain::generator::TerrainGenerator;
 use crate::voxel::chunk::{Chunk, ChunkCoord, CHUNK_SIZE};
 use crate::voxel::svo::adaptive::AdaptiveOctreeBuilder;
 
-/// Result of generating a single chunk: terrain octree + grass mask.
+/// Result of generating a single chunk: terrain octree + grass mask + rock mask.
 pub struct GeneratedChunk {
     pub chunk: Chunk,
     pub grass_mask: MaskOctree<GrassCell>,
+    pub rock_mask: MaskOctree<RockCell>,
 }
 
-/// Orchestrates chunk generation: biome mask → terrain octree → grass mask.
+/// Orchestrates chunk generation: biome mask → terrain octree → grass + rock masks.
 pub struct GenerationPipeline {
     terrain: TerrainGenerator,
     biome_map: BiomeMap,
     biome_mask_depth: u8,
     grass_mask_depth: u8,
+    rock_mask_depth: u8,
     sea_level: f32,
     profile_table: GrassProfileTable,
     seed: u32,
@@ -52,6 +58,7 @@ impl GenerationPipeline {
             biome_map,
             biome_mask_depth: config.biome_mask_depth,
             grass_mask_depth: config.grass_mask_depth,
+            rock_mask_depth: config.rock_mask_depth,
             sea_level: config.terrain_params.sea_level,
             profile_table: GrassProfileTable::default(),
             seed: config.seed,
@@ -65,7 +72,7 @@ impl GenerationPipeline {
         self.generate_chunk_with_grass(coord).chunk
     }
 
-    /// Generate a single chunk with biome-aware terrain and grass mask.
+    /// Generate a single chunk with biome-aware terrain, grass mask, and rock mask.
     pub fn generate_chunk_with_grass(&self, coord: ChunkCoord) -> GeneratedChunk {
         let origin = coord.world_origin();
         let chunk_size = CHUNK_SIZE as f32;
@@ -75,19 +82,30 @@ impl GenerationPipeline {
         let biome_mask = MaskBuilder::new(self.biome_mask_depth)
             .build(&biome_gen, origin, chunk_size);
 
-        // 2. Build terrain octree reading biome from mask
-        const TERRAIN_VOXELS: u32 = 128;
-        let voxel_size = chunk_size / TERRAIN_VOXELS as f32;
-        let classifier = MaskDrivenTerrainClassifier::new(
+        // 2. Build rock mask first (needed for terrain classifier)
+        let rock_gen = RockNoiseGenerator::new(
             &self.terrain,
             &biome_mask,
+            origin,
+            self.seed.wrapping_add(54321), // Different seed than grass
+        );
+        let rock_mask = MaskBuilder::new(self.rock_mask_depth)
+            .build(&rock_gen, origin, chunk_size);
+
+        // 3. Build terrain octree reading biome + rock from masks
+        const TERRAIN_VOXELS: u32 = 128;
+        let voxel_size = chunk_size / TERRAIN_VOXELS as f32;
+        let classifier = MaskDrivenTerrainClassifier::with_rock_mask(
+            &self.terrain,
+            &biome_mask,
+            &rock_mask,
             origin,
             voxel_size,
         );
         let builder = AdaptiveOctreeBuilder::new(TERRAIN_VOXELS);
         let octree = builder.build(&classifier, origin, chunk_size);
 
-        // 3. Build grass mask from biome mask + slope
+        // 4. Build grass mask from biome mask + slope
         let grass_gen = GrassNoiseGenerator::new(
             &self.terrain, &biome_mask, origin, &self.profile_table, self.seed,
         );
@@ -97,7 +115,7 @@ impl GenerationPipeline {
         let mut chunk = Chunk::from_octree(coord, octree);
         chunk.modified = true;
 
-        GeneratedChunk { chunk, grass_mask }
+        GeneratedChunk { chunk, grass_mask, rock_mask }
     }
 
     /// Get terrain height at a world position (delegates to TerrainGenerator).

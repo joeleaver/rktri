@@ -9,13 +9,18 @@ use crate::terrain::generator::TerrainGenerator;
 use crate::voxel::svo::classifier::{RegionClassifier, RegionHint};
 use crate::voxel::voxel::Voxel;
 
+use super::RockCell;
+
 /// Terrain classifier that reads biome data from a pre-built mask octree.
 ///
 /// Replaces `BiomeTerrainClassifier` — same height-based shell logic,
 /// but biome lookups come from the mask instead of raw noise.
+/// Optionally uses rock mask to add rock material on slopes.
 pub struct MaskDrivenTerrainClassifier<'a> {
     terrain: &'a TerrainGenerator,
     biome_mask: &'a MaskOctree<BiomeId>,
+    /// Optional rock mask for rock distribution (None = no rocks).
+    rock_mask: Option<&'a MaskOctree<RockCell>>,
     /// World-space origin of the chunk (for local→world conversion in mask lookups).
     chunk_origin: Vec3,
     voxel_size: f32,
@@ -31,6 +36,24 @@ impl<'a> MaskDrivenTerrainClassifier<'a> {
         Self {
             terrain,
             biome_mask,
+            rock_mask: None,
+            chunk_origin,
+            voxel_size,
+        }
+    }
+
+    /// Create with a rock mask for rock distribution.
+    pub fn with_rock_mask(
+        terrain: &'a TerrainGenerator,
+        biome_mask: &'a MaskOctree<BiomeId>,
+        rock_mask: &'a MaskOctree<RockCell>,
+        chunk_origin: Vec3,
+        voxel_size: f32,
+    ) -> Self {
+        Self {
+            terrain,
+            biome_mask,
+            rock_mask: Some(rock_mask),
             chunk_origin,
             voxel_size,
         }
@@ -76,7 +99,16 @@ impl<'a> RegionClassifier for MaskDrivenTerrainClassifier<'a> {
         // Get biome from mask (world pos used directly since mask origin = chunk origin)
         let biome_id = self.biome_mask.sample(self.chunk_origin, pos);
         let biome = Biome::from_id(biome_id);
-        let base = biome.surface_color();
+
+        // Check rock mask - if rock probability is high, use rock material
+        let mut material_id = biome.surface_color().material_id;
+        if let Some(rock_mask) = self.rock_mask {
+            let rock_cell = rock_mask.sample(self.chunk_origin, pos);
+            // If rock probability > 0.5, use rock material
+            if rock_cell.0 > 0.5 {
+                material_id = 4; // Rock/stone material
+            }
+        }
 
         // Compute terrain gradient via finite differences for smooth normals.
         let eps = self.voxel_size;
@@ -97,7 +129,7 @@ impl<'a> RegionClassifier for MaskDrivenTerrainClassifier<'a> {
 
         Voxel {
             color: gradient_color,
-            material_id: base.material_id,
+            material_id,
             flags,
         }
     }

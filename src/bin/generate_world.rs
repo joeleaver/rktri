@@ -82,6 +82,7 @@ fn main() {
         terrain_params: terrain_params.clone(),
         biome_mask_depth: 3,
         grass_mask_depth: 5,
+        rock_mask_depth: 4,
     };
     let pipeline = GenerationPipeline::new(&config);
 
