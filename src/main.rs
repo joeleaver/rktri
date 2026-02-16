@@ -129,27 +129,42 @@ impl RenderResources {
         let compressed_entries: Vec<CompressedEntry> = if let Some(path) = world_path {
             // Disk-loading path (pre-generated worlds)
             log::info!("Loading pre-generated world from: {}", path.display());
-            let chunks = Self::load_chunks_from_disk(path);
+            let (chunks, version) = Self::load_chunks_from_disk(path);
+            log::info!("World format version: {}", version);
+
+            // For v3 worlds, chunks are already SVDAG-compressed - use directly
+            // For v2 and earlier, apply compression now (backward compatibility)
+            let needs_svdag = version < 3;
+
             chunks.iter().map(|(coord, octree)| {
-                let raw_nodes = octree.node_count();
-                let pruned = octree.prune();
-                let pruned_nodes = pruned.node_count();
-                let before_bricks = pruned.brick_count();
-                let compressed = SvdagBuilder::new().build(&pruned);
-                log::info!("Chunk ({},{},{}): prune {} -> {} nodes, SVDAG {} -> {} bricks ({:.0}x dedup)",
-                    coord.x, coord.y, coord.z,
-                    raw_nodes, pruned_nodes,
-                    before_bricks, compressed.brick_count(),
-                    if compressed.brick_count() > 0 { before_bricks as f64 / compressed.brick_count() as f64 } else { 0.0 });
+                let octree_to_use = if needs_svdag {
+                    let raw_nodes = octree.node_count();
+                    let pruned = octree.prune();
+                    let pruned_nodes = pruned.node_count();
+                    let before_bricks = pruned.brick_count();
+                    let compressed = SvdagBuilder::new().build(&pruned);
+                    log::info!("Chunk ({},{},{}): prune {} -> {} nodes, SVDAG {} -> {} bricks ({:.0}x dedup)",
+                        coord.x, coord.y, coord.z,
+                        raw_nodes, pruned_nodes,
+                        before_bricks, compressed.brick_count(),
+                        if compressed.brick_count() > 0 { before_bricks as f64 / compressed.brick_count() as f64 } else { 0.0 });
+                    compressed
+                } else {
+                    // v3: already SVDAG-compressed on disk
+                    log::info!("Chunk ({},{},{}): v3 pre-compressed, {} nodes, {} bricks",
+                        coord.x, coord.y, coord.z,
+                        octree.node_count(), octree.brick_count());
+                    octree.clone()
+                };
                 CompressedEntry {
                     world_min: [
                         coord.x as f32 * CHUNK_SIZE as f32,
                         coord.y as f32 * CHUNK_SIZE as f32,
                         coord.z as f32 * CHUNK_SIZE as f32,
                     ],
-                    root_size: compressed.root_size(),
+                    root_size: octree_to_use.root_size(),
                     layer_id: 0, // TERRAIN
-                    octree: compressed,
+                    octree: octree_to_use,
                 }
             }).collect()
         } else {
@@ -211,7 +226,7 @@ impl RenderResources {
                 entry.world_min,
                 entry.root_size,
                 entry.layer_id,
-                0, // flags: opaque
+                0,
             );
             all_chunk_infos.push(info);
         }
@@ -873,14 +888,15 @@ impl RenderResources {
     }
 
     /// Load individual chunk octrees from disk (no merging)
-    fn load_chunks_from_disk(world_path: &PathBuf) -> Vec<(disk_io::ChunkCoord, rktri::voxel::svo::Octree)> {
+    /// Returns (chunks, version) where version is the manifest format version
+    fn load_chunks_from_disk(world_path: &PathBuf) -> (Vec<(disk_io::ChunkCoord, rktri::voxel::svo::Octree)>, u32) {
         use serde_json::Value;
 
         let manifest_path = world_path.join("manifest.json");
         if !manifest_path.exists() {
             log::error!("Manifest file not found: {}", manifest_path.display());
             log::info!("Generate a world first with: cargo run --release --bin generate_world");
-            return vec![];
+            return (vec![], 1);
         }
 
         log::info!("Reading manifest from: {}", manifest_path.display());
@@ -923,7 +939,7 @@ impl RenderResources {
                         .join(layer_dir)
                         .join(format!("chunk_{}_{}_{}.rkc", x, y, z));
 
-                    if let Some(chunk) = Self::load_chunk_file(&chunk_file, x, y, z) {
+                    if let Some(chunk) = Self::load_chunk_file(&chunk_file, x, y, z, version as u32) {
                         result.push(chunk);
                     }
                 }
@@ -944,17 +960,17 @@ impl RenderResources {
                     .join(format!("y_{}", y))
                     .join(format!("chunk_{}_{}_{}.rkc", x, y, z));
 
-                if let Some(chunk) = Self::load_chunk_file(&chunk_file, x, y, z) {
+                if let Some(chunk) = Self::load_chunk_file(&chunk_file, x, y, z, version as u32) {
                     result.push(chunk);
                 }
             }
         }
 
         log::info!("Loaded {} chunks total", result.len());
-        result
+        (result, version as u32)
     }
 
-    fn load_chunk_file(path: &std::path::Path, x: i32, y: i32, z: i32)
+    fn load_chunk_file(path: &std::path::Path, x: i32, y: i32, z: i32, world_version: u32)
         -> Option<(disk_io::ChunkCoord, rktri::voxel::svo::Octree)>
     {
         if !path.exists() {
@@ -964,8 +980,16 @@ impl RenderResources {
 
         let compressed = std::fs::read(path)
             .expect(&format!("Failed to read chunk file: {}", path.display()));
-        let chunk = disk_io::decompress_chunk(&compressed)
-            .expect(&format!("Failed to decompress chunk: {}", path.display()));
+
+        let chunk = if world_version >= 3 {
+            // v3: SVDAG pre-compressed on disk
+            disk_io::decompress_svdag_chunk(&compressed)
+                .expect(&format!("Failed to decompress SVDAG chunk: {}", path.display()))
+        } else {
+            // v2 and earlier: apply compression at load time
+            disk_io::decompress_chunk(&compressed)
+                .expect(&format!("Failed to decompress chunk: {}", path.display()))
+        };
 
         log::info!("Loaded chunk ({},{},{}): {} nodes, {} bricks",
             x, y, z, chunk.octree.node_count(), chunk.octree.brick_count());

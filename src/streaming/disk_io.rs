@@ -22,7 +22,7 @@ impl ChunkCoord {
     }
 }
 
-/// Serializable chunk data
+/// Serializable chunk data (v2 - raw, uncompressed)
 ///
 /// Since OctreeNode and VoxelBrick already implement Pod/Zeroable (bytemuck),
 /// we can serialize them directly as byte arrays for efficient storage.
@@ -36,6 +36,23 @@ pub struct ChunkData {
     /// Serialized OctreeNode data (already Pod-compatible)
     pub nodes: Vec<OctreeNode>,
     /// Serialized VoxelBrick data (already Pod-compatible)
+    pub bricks: Vec<VoxelBrick>,
+}
+
+/// Serializable chunk data (v3 - SVDAG pre-compressed)
+///
+/// Chunks are stored with SVDAG compression already applied.
+/// This avoids redundant compression work at game startup.
+#[derive(Archive, Deserialize, Serialize)]
+pub struct SvdagChunkData {
+    pub coord_x: i32,
+    pub coord_y: i32,
+    pub coord_z: i32,
+    pub root_size: f32,
+    pub max_depth: u8,
+    /// SVDAG-compressed OctreeNode data (bricks already deduplicated)
+    pub nodes: Vec<OctreeNode>,
+    /// SVDAG-compressed VoxelBrick data (bricks already deduplicated)
     pub bricks: Vec<VoxelBrick>,
 }
 
@@ -103,7 +120,7 @@ pub fn serialize_chunk(chunk: &Chunk) -> Result<Vec<u8>, io::Error> {
     Ok(bytes.to_vec())
 }
 
-/// Deserialize a chunk from bytes (uncompressed)
+/// Deserialize a chunk from bytes (uncompressed v2)
 pub fn deserialize_chunk(data: &[u8]) -> Result<Chunk, io::Error> {
     // Deserialize using rkyv
     let archived = rkyv::access::<ArchivedChunkData, rkyv::rancor::Error>(data)
@@ -125,17 +142,63 @@ pub fn deserialize_chunk(data: &[u8]) -> Result<Chunk, io::Error> {
     Ok(Chunk::from_octree(coord, octree))
 }
 
+/// Deserialize an SVDAG-precompressed chunk from bytes (v3)
+pub fn deserialize_svdag_chunk(data: &[u8]) -> Result<Chunk, io::Error> {
+    // Deserialize using rkyv
+    let archived = rkyv::access::<ArchivedSvdagChunkData, rkyv::rancor::Error>(data)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    let chunk_data: SvdagChunkData = rkyv::deserialize::<SvdagChunkData, rkyv::rancor::Error>(archived)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    // Reconstruct octree from SVDAG-compressed data
+    let octree = Octree::from_serialized(
+        chunk_data.root_size,
+        chunk_data.max_depth,
+        chunk_data.nodes,
+        chunk_data.bricks,
+    );
+
+    let coord = ChunkCoord::new(chunk_data.coord_x, chunk_data.coord_y, chunk_data.coord_z);
+
+    Ok(Chunk::from_octree(coord, octree))
+}
+
 /// Compress a serialized chunk using LZ4
 pub fn compress_chunk(chunk: &Chunk) -> Result<Vec<u8>, io::Error> {
     let serialized = serialize_chunk(chunk)?;
     Ok(lz4_flex::compress_prepend_size(&serialized))
 }
 
-/// Decompress and deserialize a chunk
+/// Serialize an SVDAG-compressed chunk (for v3 world format)
+pub fn serialize_svdag_chunk(chunk: &Chunk) -> Result<Vec<u8>, io::Error> {
+    let data = SvdagChunkData {
+        coord_x: chunk.coord.x,
+        coord_y: chunk.coord.y,
+        coord_z: chunk.coord.z,
+        root_size: chunk.octree.root_size(),
+        max_depth: chunk.octree.max_depth(),
+        nodes: chunk.octree.nodes_slice().to_vec(),
+        bricks: chunk.octree.bricks_slice().to_vec(),
+    };
+
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&data)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    Ok(bytes.to_vec())
+}
+
+/// Decompress and deserialize a chunk (v2 format)
 pub fn decompress_chunk(data: &[u8]) -> Result<Chunk, io::Error> {
     let decompressed = lz4_flex::decompress_size_prepended(data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("LZ4 decompression failed: {}", e)))?;
     deserialize_chunk(&decompressed)
+}
+
+/// Decompress and deserialize an SVDAG-compressed chunk (v3 format)
+pub fn decompress_svdag_chunk(data: &[u8]) -> Result<Chunk, io::Error> {
+    let decompressed = lz4_flex::decompress_size_prepended(data)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("LZ4 decompression failed: {}", e)))?;
+    deserialize_svdag_chunk(&decompressed)
 }
 
 /// Get the file path for a chunk
@@ -147,7 +210,7 @@ pub fn chunk_path(base_dir: &Path, coord: ChunkCoord) -> PathBuf {
         .join(format!("chunk_{}_{}_{}.rkc", coord.x, coord.y, coord.z))
 }
 
-/// Save a chunk to disk (compressed)
+/// Save a chunk to disk (compressed, v2 format)
 pub async fn save_chunk(base_dir: &Path, chunk: &Chunk) -> Result<(), io::Error> {
     let path = chunk_path(base_dir, chunk.coord);
 
@@ -157,6 +220,22 @@ pub async fn save_chunk(base_dir: &Path, chunk: &Chunk) -> Result<(), io::Error>
     }
 
     let compressed = compress_chunk(chunk)?;
+    tokio::fs::write(&path, compressed).await?;
+
+    Ok(())
+}
+
+/// Save an SVDAG-precompressed chunk to disk (v3 format)
+pub async fn save_svdag_chunk(base_dir: &Path, chunk: &Chunk) -> Result<(), io::Error> {
+    let path = chunk_path(base_dir, chunk.coord);
+
+    // Create parent directory if it doesn't exist
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let serialized = serialize_svdag_chunk(chunk)?;
+    let compressed = lz4_flex::compress_prepend_size(&serialized);
     tokio::fs::write(&path, compressed).await?;
 
     Ok(())

@@ -33,6 +33,7 @@ use rktri::generation::{GenerationConfig, GenerationPipeline};
 use rktri::streaming::disk_io;
 use rktri::terrain::generator::TerrainParams;
 use rktri::voxel::chunk::{ChunkCoord, CHUNK_SIZE};
+use rktri::voxel::svo::svdag::SvdagBuilder;
 
 fn main() {
     env_logger::Builder::from_env(
@@ -142,9 +143,14 @@ fn main() {
                 return None;
             }
 
-            // Write terrain chunk
+            // Write terrain chunk with SVDAG pre-compression
             let disk_coord = disk_io::ChunkCoord::new(coord.x, coord.y, coord.z);
-            let disk_chunk = disk_io::Chunk::from_octree(disk_coord, result.chunk.octree);
+
+            // Apply SVDAG compression ONCE during world generation
+            let pruned = result.chunk.octree.prune();
+            let svdag = SvdagBuilder::new().build(&pruned);
+
+            let disk_chunk = disk_io::Chunk::from_octree(disk_coord, svdag);
             let compressed = disk_io::compress_chunk(&disk_chunk)
                 .expect("Failed to compress chunk");
 
@@ -189,7 +195,7 @@ fn main() {
 
     let manifest = json!({
         "name": name,
-        "version": 2,
+        "version": 3,
         "seed": seed,
         "size": size,
         "chunk_size": CHUNK_SIZE,
