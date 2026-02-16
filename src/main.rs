@@ -109,7 +109,7 @@ struct RenderResources {
 }
 
 impl RenderResources {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: wgpu::TextureFormat, width: u32, height: u32, render_scale: f32, world_path: &PathBuf) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: wgpu::TextureFormat, width: u32, height: u32, render_scale: f32, world_path: &PathBuf, view_distance: f32) -> Self {
         use rktri::voxel::chunk::CHUNK_SIZE;
 
         // Only path: load pre-generated v3 world from disk (SVDAG pre-compressed)
@@ -121,7 +121,7 @@ impl RenderResources {
         }
 
         log::info!("Loading pre-generated v3 world from: {}", world_path.display());
-        let chunks = Self::load_chunks_from_disk(world_path);
+        let chunks = Self::load_chunks_from_disk(world_path, view_distance);
 
         let compressed_entries: Vec<CompressedEntry> = chunks.iter().map(|(coord, octree)| {
             CompressedEntry {
@@ -827,8 +827,10 @@ impl RenderResources {
     }
 
     /// Load individual chunk octrees from disk (v3 format only - SVDAG pre-compressed)
-    fn load_chunks_from_disk(world_path: &PathBuf) -> Vec<(disk_io::ChunkCoord, rktri::voxel::svo::Octree)> {
+    /// Only loads chunks within view_distance of center (0 = load all)
+    fn load_chunks_from_disk(world_path: &PathBuf, view_distance: f32) -> Vec<(disk_io::ChunkCoord, rktri::voxel::svo::Octree)> {
         use serde_json::Value;
+        use rktri::voxel::chunk::CHUNK_SIZE;
 
         let manifest_path = world_path.join("manifest.json");
         if !manifest_path.exists() {
@@ -871,10 +873,27 @@ impl RenderResources {
 
             log::info!("Loading layer '{}': {} chunks", layer_name, chunk_list.len());
 
+            // Get world center from manifest (approximate)
+            let world_center_x = manifest["size"].as_f64().unwrap_or(0.0) as f32 / 2.0;
+            let world_center_z = manifest["size"].as_f64().unwrap_or(0.0) as f32 / 2.0;
+            let chunk_size = CHUNK_SIZE as f32;
+
             for chunk_info in chunk_list {
                 let x = chunk_info["x"].as_i64().unwrap() as i32;
                 let y = chunk_info["y"].as_i64().unwrap() as i32;
                 let z = chunk_info["z"].as_i64().unwrap() as i32;
+
+                // Filter by view distance if specified
+                if view_distance > 0.0 {
+                    let chunk_world_x = x as f32 * chunk_size;
+                    let chunk_world_z = z as f32 * chunk_size;
+                    let dx = chunk_world_x - world_center_x;
+                    let dz = chunk_world_z - world_center_z;
+                    let dist = (dx * dx + dz * dz).sqrt();
+                    if dist > view_distance {
+                        continue;
+                    }
+                }
 
                 let chunk_file = world_path
                     .join(layer_dir)
@@ -1536,6 +1555,7 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
     resources: Option<RenderResources>,
+    view_distance: f32,
     camera: Camera,
     controller: FpsCameraController,
     input: InputState,
@@ -1564,6 +1584,7 @@ impl App {
         if let Some(size) = world_size {
             config.view_distance = size / 2.0; // size is diameter, view_distance is radius
         }
+        let view_distance = config.view_distance;
         let initial_pos = config.initial_camera_pos;
         // Look at terrain from above, angled toward horizon
         let target = initial_pos + glam::Vec3::new(10.0, -8.0, 10.0);
@@ -1571,6 +1592,7 @@ impl App {
             window: None,
             gpu: None,
             resources: None,
+            view_distance,
             camera: Camera::look_at(initial_pos, target, glam::Vec3::Y),
             controller: FpsCameraController::new(2.0, 0.5),  // Slower for small world
             input: InputState::new(),
@@ -2517,7 +2539,7 @@ impl ApplicationHandler for App {
 
         // Create render resources - requires pre-generated v3 world
         let world_path = self.world_path.clone().expect("No world specified. Generate one with: cargo run --release --bin generate_world -- --size <N> --name <name>");
-        let resources = RenderResources::new(&gpu.device, &gpu.queue, gpu.format(), size.width, size.height, self.render_scale, &world_path);
+        let resources = RenderResources::new(&gpu.device, &gpu.queue, gpu.format(), size.width, size.height, self.render_scale, &world_path, self.view_distance);
 
         #[cfg(feature = "dlss")]
         {
