@@ -20,8 +20,7 @@ pub struct SceneManager {
     pipeline: GenerationPipeline,
     scene_graph: SceneGraph,
     terrain_node: SceneNodeId,
-    rocks_node: SceneNodeId,
-    vegetation_node: SceneNodeId,
+    static_objects_node: SceneNodeId,
 }
 
 impl SceneManager {
@@ -38,17 +37,11 @@ impl SceneManager {
             LayerId::TERRAIN,
             NodeContent::ChunkedRegion { chunks: HashMap::new() },
         );
-        let rocks_node = scene_graph.add_child(
+        let static_objects_node = scene_graph.add_child(
             root,
-            "rocks",
+            "static_objects",
             LayerId::STATIC_OBJECTS,
-            NodeContent::ChunkedRegion { chunks: HashMap::new() },
-        );
-        let vegetation_node = scene_graph.add_child(
-            root,
-            "vegetation",
-            LayerId::STATIC_OBJECTS,
-            NodeContent::ChunkedRegion { chunks: HashMap::new() },
+            NodeContent::Group,
         );
 
         Self {
@@ -56,8 +49,7 @@ impl SceneManager {
             pipeline,
             scene_graph,
             terrain_node,
-            rocks_node,
-            vegetation_node,
+            static_objects_node,
         }
     }
 
@@ -75,22 +67,21 @@ impl SceneManager {
         }
     }
 
-    /// Insert a rock chunk's octree into the scene graph's rocks layer.
-    pub fn insert_rock_chunk(&mut self, coord: ChunkCoord, octree: Octree) {
-        if let Some(node) = self.scene_graph.get_mut(self.rocks_node) {
-            if let NodeContent::ChunkedRegion { ref mut chunks } = node.content {
-                chunks.insert(coord, octree);
-            }
-        }
-    }
-
-    /// Insert a vegetation chunk's octree into the scene graph's vegetation layer.
-    pub fn insert_vegetation_chunk(&mut self, coord: ChunkCoord, octree: Octree) {
-        if let Some(node) = self.scene_graph.get_mut(self.vegetation_node) {
-            if let NodeContent::ChunkedRegion { ref mut chunks } = node.content {
-                chunks.insert(coord, octree);
-            }
-        }
+    /// Add a voxel model instance (tree, rock, etc.) to the static objects layer.
+    /// The model will be positioned at the given world position.
+    pub fn add_voxel_instance(&mut self, name: impl Into<String>, octree: Octree, position: Vec3) {
+        let bounds = Vec3::splat(octree.root_size());
+        use super::node::LocalTransform;
+        let new_node_id = self.scene_graph.add_child(
+            self.static_objects_node,
+            name,
+            LayerId::STATIC_OBJECTS,
+            NodeContent::VoxelInstance {
+                model: std::sync::Arc::new(octree),
+                bounds,
+            },
+        );
+        self.scene_graph.set_transform(new_node_id, LocalTransform::from_position(position));
     }
 
     /// Generate chunks around a center position within view distance.
@@ -98,8 +89,6 @@ impl SceneManager {
     /// For each XZ column, samples the terrain height and only generates Y levels
     /// near the surface (typically 2-3 instead of all 21). Empty chunks are not
     /// inserted into the scene graph.
-    ///
-    /// Generates terrain, rock, and tree octrees separately for multi-layer rendering.
     pub fn generate_chunks_around(&mut self, center: Vec3, radius: f32) {
         let center_coord = ChunkCoord::from_world_pos(center);
         let chunk_radius = (radius / CHUNK_SIZE as f32).floor() as i32;
@@ -109,38 +98,20 @@ impl SceneManager {
             center_coord, radius, chunk_radius
         );
 
-        // Generate layered chunks (terrain + rocks + trees)
-        let results = self.pipeline.generate_chunks_with_grass_around(
+        let results = self.pipeline.generate_chunks_around(
             center,
             radius,
             &|coord| self.has_chunk(coord),
         );
 
-        let mut terrain_count = 0u32;
-        let mut rock_count = 0u32;
-        let mut tree_count = 0u32;
-
-        for (coord, generated) in results {
-            // Insert terrain octree
-            self.insert_chunk(coord, generated.chunk.octree);
-            terrain_count += 1;
-
-            // Insert rock octree if present
-            if let Some(rock_octree) = generated.rock_octree {
-                self.insert_rock_chunk(coord, rock_octree);
-                rock_count += 1;
-            }
-
-            // Insert tree octree if present
-            if let Some(tree_octree) = generated.tree_octree {
-                self.insert_vegetation_chunk(coord, tree_octree);
-                tree_count += 1;
-            }
+        let generated = results.len() as u32;
+        for (coord, chunk) in results {
+            self.insert_chunk(coord, chunk.octree);
         }
 
         log::info!(
-            "Chunk generation complete: {} terrain, {} rocks, {} trees",
-            terrain_count, rock_count, tree_count
+            "Chunk generation complete: {} with geometry inserted",
+            generated
         );
     }
 
@@ -204,36 +175,6 @@ impl SceneManager {
             }
         }
         0
-    }
-
-    /// Get rock chunks as (coord, octree) pairs.
-    pub fn get_rock_chunks(&self) -> Vec<(ChunkCoord, Octree)> {
-        if let Some(node) = self.scene_graph.get(self.rocks_node) {
-            if let NodeContent::ChunkedRegion { ref chunks } = node.content {
-                return chunks.iter().map(|(c, o)| (*c, o.clone())).collect();
-            }
-        }
-        Vec::new()
-    }
-
-    /// Get vegetation chunks as (coord, octree) pairs.
-    pub fn get_vegetation_chunks(&self) -> Vec<(ChunkCoord, Octree)> {
-        if let Some(node) = self.scene_graph.get(self.vegetation_node) {
-            if let NodeContent::ChunkedRegion { ref chunks } = node.content {
-                return chunks.iter().map(|(c, o)| (*c, o.clone())).collect();
-            }
-        }
-        Vec::new()
-    }
-
-    /// Get the rocks node ID.
-    pub fn rocks_node(&self) -> SceneNodeId {
-        self.rocks_node
-    }
-
-    /// Get the vegetation node ID.
-    pub fn vegetation_node(&self) -> SceneNodeId {
-        self.vegetation_node
     }
 }
 
@@ -332,8 +273,8 @@ mod tests {
         let config = SceneConfig::default();
         let manager = SceneManager::new(config);
 
-        // Root + terrain + rocks + vegetation nodes
-        assert_eq!(manager.scene_graph().node_count(), 4);
+        // Root + terrain node
+        assert_eq!(manager.scene_graph().node_count(), 2);
     }
 
     // --- Heavy integration tests ---

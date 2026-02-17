@@ -46,6 +46,8 @@ impl LayerId {
     pub const WATER: LayerId = LayerId(3);
     /// Effects layer (particles, fog) - per-frame, volumetric
     pub const EFFECTS: LayerId = LayerId(4);
+    /// Ground clutter layer (rocks, sticks, fallen logs) - static, opaque
+    pub const GROUND_CLUTTER: LayerId = LayerId(5);
 }
 
 /// Configuration for a render layer.
@@ -119,27 +121,32 @@ pub fn default_layers() -> Vec<LayerConfig> {
             .with_render_mode(LayerRenderMode::Opaque)
             .with_update_frequency(UpdateFrequency::Static)
             .with_priority(0)
-            .with_streaming_budget(0.4),
+            .with_streaming_budget(0.35),
         LayerConfig::new(LayerId::STATIC_OBJECTS, "Static Objects")
             .with_render_mode(LayerRenderMode::Opaque)
             .with_update_frequency(UpdateFrequency::Dynamic)
             .with_priority(1)
-            .with_streaming_budget(0.3),
+            .with_streaming_budget(0.20),
         LayerConfig::new(LayerId::DYNAMIC_OBJECTS, "Dynamic Objects")
             .with_render_mode(LayerRenderMode::Opaque)
             .with_update_frequency(UpdateFrequency::PerFrame)
             .with_priority(2)
-            .with_streaming_budget(0.1),
+            .with_streaming_budget(0.10),
+        LayerConfig::new(LayerId::GROUND_CLUTTER, "Ground Clutter")
+            .with_render_mode(LayerRenderMode::Opaque)
+            .with_update_frequency(UpdateFrequency::Static)
+            .with_priority(1) // Render with static objects
+            .with_streaming_budget(0.15),
         LayerConfig::new(LayerId::WATER, "Water")
             .with_render_mode(LayerRenderMode::Transparent)
             .with_update_frequency(UpdateFrequency::Dynamic)
             .with_priority(10) // Render after opaque
-            .with_streaming_budget(0.1),
+            .with_streaming_budget(0.10),
         LayerConfig::new(LayerId::EFFECTS, "Effects")
             .with_render_mode(LayerRenderMode::Volumetric)
             .with_update_frequency(UpdateFrequency::PerFrame)
             .with_priority(20) // Render last
-            .with_streaming_budget(0.1),
+            .with_streaming_budget(0.10),
     ]
 }
 
@@ -166,7 +173,7 @@ mod tests {
     #[test]
     fn test_default_layers() {
         let layers = default_layers();
-        assert_eq!(layers.len(), 5);
+        assert_eq!(layers.len(), 6);
 
         // Budget should sum to ~1.0
         let total_budget: f32 = layers.iter().map(|l| l.streaming_budget_fraction).sum();

@@ -103,6 +103,16 @@ impl Camera {
         self.rotation = Quat::from_euler(glam::EulerRot::YXZ, yaw, pitch, 0.0);
     }
 
+    /// Get rotation as euler angles (yaw, pitch in radians)
+    pub fn euler_angles(&self) -> (f32, f32) {
+        let f = self.forward();
+        // yaw: rotation around Y axis (horizontal)
+        let yaw = f.z.atan2(f.x);
+        // pitch: rotation around X axis (vertical)
+        let pitch = (-f.y).asin();
+        (yaw, pitch)
+    }
+
     /// Update aspect ratio (call on window resize)
     pub fn set_aspect(&mut self, width: f32, height: f32) {
         self.aspect = width / height;

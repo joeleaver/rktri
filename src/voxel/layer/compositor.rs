@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn test_default_compositor() {
         let compositor = LayerCompositor::default();
-        assert_eq!(compositor.layer_count(), 5);
+        assert_eq!(compositor.layer_count(), 6);
     }
 
     #[test]
@@ -166,7 +166,7 @@ mod tests {
         let total = 1000;
 
         let terrain_budget = compositor.streaming_budget_for_layer(LayerId::TERRAIN, total);
-        assert_eq!(terrain_budget, 400); // 40% of 1000
+        assert_eq!(terrain_budget, 350); // 35% of 1000
     }
 
     #[test]

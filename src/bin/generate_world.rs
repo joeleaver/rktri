@@ -33,7 +33,6 @@ use rktri::generation::{GenerationConfig, GenerationPipeline};
 use rktri::streaming::disk_io;
 use rktri::terrain::generator::TerrainParams;
 use rktri::voxel::chunk::{ChunkCoord, CHUNK_SIZE};
-use rktri::voxel::svo::svdag::SvdagBuilder;
 
 fn main() {
     env_logger::Builder::from_env(
@@ -49,9 +48,6 @@ fn main() {
     let scale = parse_f32_arg(&args, "--scale").unwrap_or(150.0);
     let height_scale = parse_f32_arg(&args, "--height").unwrap_or(80.0);
     let jobs = parse_usize_arg(&args, "--jobs").unwrap_or(4);
-    let terrain_only = args.iter().any(|a| a == "--terrain-only");
-    let grass_only = args.iter().any(|a| a == "--grass");
-    let rocks_only = args.iter().any(|a| a == "--rocks");
 
     // Limit rayon's thread pool to cap peak memory usage
     rayon::ThreadPoolBuilder::new()
@@ -85,8 +81,7 @@ fn main() {
         terrain_params: terrain_params.clone(),
         biome_mask_depth: 3,
         grass_mask_depth: 5,
-        rock_mask_depth: 4,
-        tree_mask_depth: 4,
+        clutter_mask_depth: 4,
     };
     let pipeline = GenerationPipeline::new(&config);
 
@@ -121,181 +116,19 @@ fn main() {
     // Phase 2: Generate terrain + grass layers
     let terrain_dir = output_dir.join("terrain");
     let grass_dir = output_dir.join("grass");
-    let rocks_dir = output_dir.join("rocks");
-    let vegetation_dir = output_dir.join("vegetation");
     std::fs::create_dir_all(&terrain_dir).expect("Failed to create terrain directory");
     std::fs::create_dir_all(&grass_dir).expect("Failed to create grass directory");
-    std::fs::create_dir_all(&rocks_dir).expect("Failed to create rocks directory");
-    std::fs::create_dir_all(&vegetation_dir).expect("Failed to create vegetation directory");
 
     let start = Instant::now();
     let generated = AtomicUsize::new(0);
     let total_terrain_bytes = AtomicUsize::new(0);
     let total_grass_bytes = AtomicUsize::new(0);
-    let total_rock_bytes = AtomicUsize::new(0);
-    let total_vegetation_bytes = AtomicUsize::new(0);
     let grass_chunk_count = AtomicUsize::new(0);
-    let rock_chunk_count = AtomicUsize::new(0);
-    let vegetation_chunk_count = AtomicUsize::new(0);
 
-    // Phase 2: Generate terrain (and optionally grass/rocks/vegetation)
-    let terrain_chunks: Vec<(i32, i32, i32)> = if terrain_only {
-        // Terrain-only mode: just generate terrain chunks (no grass, no rocks, no vegetation)
-        coords
-            .par_iter()
-            .filter_map(|&coord| {
-                let chunk = pipeline.generate_chunk(coord);
-                let done = generated.fetch_add(1, Ordering::Relaxed) + 1;
-
-                if done % 1000 == 0 || done == total {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let rate = done as f64 / elapsed;
-                    let remaining = (total - done) as f64 / rate;
-                    eprintln!("  [{}/{}] {:.0} chunks/sec, ~{:.0}s remaining",
-                        done, total, rate, remaining);
-                }
-
-                if chunk.octree.brick_count() == 0 {
-                    return None;
-                }
-
-                // Write terrain chunk with SVDAG pre-compression (v3 format)
-                let disk_coord = disk_io::ChunkCoord::new(coord.x, coord.y, coord.z);
-                let pruned = chunk.octree.prune();
-                let svdag = SvdagBuilder::new().build(&pruned);
-
-                let disk_chunk = disk_io::Chunk::from_octree(disk_coord, svdag);
-                let compressed = disk_io::serialize_svdag_chunk(&disk_chunk)
-                    .expect("Failed to serialize SVDAG chunk");
-                let compressed = lz4_flex::compress_prepend_size(&compressed);
-
-                let chunk_file = terrain_dir.join(format!("chunk_{}_{}_{}.rkc", coord.x, coord.y, coord.z));
-                total_terrain_bytes.fetch_add(compressed.len(), Ordering::Relaxed);
-                std::fs::write(&chunk_file, &compressed)
-                    .expect("Failed to write chunk file");
-
-                Some((coord.x, coord.y, coord.z))
-            })
-            .collect()
-    } else if grass_only {
-        // Grass-only mode: terrain + grass (no rocks, no vegetation)
-        coords
-            .par_iter()
-            .filter_map(|&coord| {
-                let result = pipeline.generate_chunk_with_grass(coord);
-                let done = generated.fetch_add(1, Ordering::Relaxed) + 1;
-
-                if done % 1000 == 0 || done == total {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let rate = done as f64 / elapsed;
-                    let remaining = (total - done) as f64 / rate;
-                    eprintln!("  [{}/{}] {:.0} chunks/sec, ~{:.0}s remaining",
-                        done, total, rate, remaining);
-                }
-
-                if result.chunk.octree.brick_count() == 0 {
-                    return None;
-                }
-
-                // Write terrain chunk with SVDAG pre-compression (v3 format)
-                let disk_coord = disk_io::ChunkCoord::new(coord.x, coord.y, coord.z);
-                let pruned = result.chunk.octree.prune();
-                let svdag = SvdagBuilder::new().build(&pruned);
-
-                let disk_chunk = disk_io::Chunk::from_octree(disk_coord, svdag);
-                let compressed = disk_io::serialize_svdag_chunk(&disk_chunk)
-                    .expect("Failed to serialize SVDAG chunk");
-                let compressed = lz4_flex::compress_prepend_size(&compressed);
-
-                let chunk_file = terrain_dir.join(format!("chunk_{}_{}_{}.rkc", coord.x, coord.y, coord.z));
-                total_terrain_bytes.fetch_add(compressed.len(), Ordering::Relaxed);
-                std::fs::write(&chunk_file, &compressed)
-                    .expect("Failed to write chunk file");
-
-                // Write grass mask (only if non-empty)
-                if !result.grass_mask.is_empty() {
-                    let grass_compressed = disk_io::compress_grass_mask(disk_coord, &result.grass_mask)
-                        .expect("Failed to compress grass mask");
-                    let grass_file = grass_dir.join(format!("chunk_{}_{}_{}.rkm", coord.x, coord.y, coord.z));
-                    total_grass_bytes.fetch_add(grass_compressed.len(), Ordering::Relaxed);
-                    std::fs::write(&grass_file, &grass_compressed)
-                        .expect("Failed to write grass mask file");
-                    grass_chunk_count.fetch_add(1, Ordering::Relaxed);
-                }
-
-                Some((coord.x, coord.y, coord.z))
-            })
-            .collect()
-    } else if rocks_only {
-        // Rocks mode: terrain + grass + rocks (no vegetation)
-        coords
-            .par_iter()
-            .filter_map(|&coord| {
-                let result = pipeline.generate_chunk_with_grass(coord);
-                let done = generated.fetch_add(1, Ordering::Relaxed) + 1;
-
-                if done % 1000 == 0 || done == total {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let rate = done as f64 / elapsed;
-                    let remaining = (total - done) as f64 / rate;
-                    eprintln!("  [{}/{}] {:.0} chunks/sec, ~{:.0}s remaining",
-                        done, total, rate, remaining);
-                }
-
-                if result.chunk.octree.brick_count() == 0 {
-                    return None;
-                }
-
-                // Write terrain chunk with SVDAG pre-compression (v3 format)
-                let disk_coord = disk_io::ChunkCoord::new(coord.x, coord.y, coord.z);
-                let pruned = result.chunk.octree.prune();
-                let svdag = SvdagBuilder::new().build(&pruned);
-
-                let disk_chunk = disk_io::Chunk::from_octree(disk_coord, svdag);
-                let compressed = disk_io::serialize_svdag_chunk(&disk_chunk)
-                    .expect("Failed to serialize SVDAG chunk");
-                let compressed = lz4_flex::compress_prepend_size(&compressed);
-
-                let chunk_file = terrain_dir.join(format!("chunk_{}_{}_{}.rkc", coord.x, coord.y, coord.z));
-                total_terrain_bytes.fetch_add(compressed.len(), Ordering::Relaxed);
-                std::fs::write(&chunk_file, &compressed)
-                    .expect("Failed to write chunk file");
-
-                // Write grass mask (only if non-empty)
-                if !result.grass_mask.is_empty() {
-                    let grass_compressed = disk_io::compress_grass_mask(disk_coord, &result.grass_mask)
-                        .expect("Failed to compress grass mask");
-                    let grass_file = grass_dir.join(format!("chunk_{}_{}_{}.rkm", coord.x, coord.y, coord.z));
-                    total_grass_bytes.fetch_add(grass_compressed.len(), Ordering::Relaxed);
-                    std::fs::write(&grass_file, &grass_compressed)
-                        .expect("Failed to write grass mask file");
-                    grass_chunk_count.fetch_add(1, Ordering::Relaxed);
-                }
-
-                // Write rock octree (only if non-empty)
-                if let Some(rock_octree) = result.rock_octree {
-                    let pruned = rock_octree.prune();
-                    let svdag = SvdagBuilder::new().build(&pruned);
-                    let disk_chunk = disk_io::Chunk::from_octree(disk_coord, svdag);
-                    let compressed = disk_io::serialize_svdag_chunk(&disk_chunk)
-                        .expect("Failed to serialize rock chunk");
-                    let compressed = lz4_flex::compress_prepend_size(&compressed);
-                    let rock_file = rocks_dir.join(format!("chunk_{}_{}_{}.rkc", coord.x, coord.y, coord.z));
-                    total_rock_bytes.fetch_add(compressed.len(), Ordering::Relaxed);
-                    std::fs::write(&rock_file, &compressed)
-                        .expect("Failed to write rock chunk file");
-                    rock_chunk_count.fetch_add(1, Ordering::Relaxed);
-                }
-
-                Some((coord.x, coord.y, coord.z))
-            })
-            .collect()
-    } else {
-        // Full generation: terrain + grass + rocks + vegetation
-        coords
-            .par_iter()
-            .filter_map(|&coord| {
-                let result = pipeline.generate_chunk_with_grass(coord);
+    let terrain_chunks: Vec<(i32, i32, i32)> = coords
+        .par_iter()
+        .filter_map(|&coord| {
+            let result = pipeline.generate_chunk_with_grass(coord);
             let done = generated.fetch_add(1, Ordering::Relaxed) + 1;
 
             if done % 1000 == 0 || done == total {
@@ -310,17 +143,11 @@ fn main() {
                 return None;
             }
 
-            // Write terrain chunk with SVDAG pre-compression (v3 format)
+            // Write terrain chunk
             let disk_coord = disk_io::ChunkCoord::new(coord.x, coord.y, coord.z);
-
-            // Apply SVDAG compression ONCE during world generation
-            let pruned = result.chunk.octree.prune();
-            let svdag = SvdagBuilder::new().build(&pruned);
-
-            let disk_chunk = disk_io::Chunk::from_octree(disk_coord, svdag);
-            let compressed = disk_io::serialize_svdag_chunk(&disk_chunk)
-                .expect("Failed to serialize SVDAG chunk");
-            let compressed = lz4_flex::compress_prepend_size(&compressed);
+            let disk_chunk = disk_io::Chunk::from_octree(disk_coord, result.chunk.octree);
+            let compressed = disk_io::compress_chunk(&disk_chunk)
+                .expect("Failed to compress chunk");
 
             let chunk_file = terrain_dir.join(format!("chunk_{}_{}_{}.rkc", coord.x, coord.y, coord.z));
             total_terrain_bytes.fetch_add(compressed.len(), Ordering::Relaxed);
@@ -338,61 +165,22 @@ fn main() {
                 grass_chunk_count.fetch_add(1, Ordering::Relaxed);
             }
 
-            // Write rock octree (only if non-empty)
-            if let Some(rock_octree) = result.rock_octree {
-                let pruned = rock_octree.prune();
-                let svdag = SvdagBuilder::new().build(&pruned);
-                let disk_chunk = disk_io::Chunk::from_octree(disk_coord, svdag);
-                let compressed = disk_io::serialize_svdag_chunk(&disk_chunk)
-                    .expect("Failed to serialize rock chunk");
-                let compressed = lz4_flex::compress_prepend_size(&compressed);
-                let rock_file = rocks_dir.join(format!("chunk_{}_{}_{}.rkc", coord.x, coord.y, coord.z));
-                total_rock_bytes.fetch_add(compressed.len(), Ordering::Relaxed);
-                std::fs::write(&rock_file, &compressed)
-                    .expect("Failed to write rock chunk file");
-                rock_chunk_count.fetch_add(1, Ordering::Relaxed);
-            }
-
-            // Write vegetation (tree) octree (only if non-empty)
-            if let Some(tree_octree) = result.tree_octree {
-                let pruned = tree_octree.prune();
-                let svdag = SvdagBuilder::new().build(&pruned);
-                let disk_chunk = disk_io::Chunk::from_octree(disk_coord, svdag);
-                let compressed = disk_io::serialize_svdag_chunk(&disk_chunk)
-                    .expect("Failed to serialize vegetation chunk");
-                let compressed = lz4_flex::compress_prepend_size(&compressed);
-                let veg_file = vegetation_dir.join(format!("chunk_{}_{}_{}.rkc", coord.x, coord.y, coord.z));
-                total_vegetation_bytes.fetch_add(compressed.len(), Ordering::Relaxed);
-                std::fs::write(&veg_file, &compressed)
-                    .expect("Failed to write vegetation chunk file");
-                vegetation_chunk_count.fetch_add(1, Ordering::Relaxed);
-            }
-
             Some((coord.x, coord.y, coord.z))
         })
-        .collect()
-    }; // End if terrain_only
+        .collect();
 
     let elapsed = start.elapsed();
     let terrain_bytes = total_terrain_bytes.load(Ordering::Relaxed);
     let grass_bytes = total_grass_bytes.load(Ordering::Relaxed);
     let grass_count = grass_chunk_count.load(Ordering::Relaxed);
-    let rock_bytes = total_rock_bytes.load(Ordering::Relaxed);
-    let rock_count = rock_chunk_count.load(Ordering::Relaxed);
-    let vegetation_bytes = total_vegetation_bytes.load(Ordering::Relaxed);
-    let vegetation_count = vegetation_chunk_count.load(Ordering::Relaxed);
 
     println!();
-    println!("Terrain:    {} chunks in {:.1}s ({:.0} chunks/sec, {:.1} MB)",
+    println!("Terrain: {} chunks in {:.1}s ({:.0} chunks/sec, {:.1} MB)",
         terrain_chunks.len(), elapsed.as_secs_f64(),
         total as f64 / elapsed.as_secs_f64(),
         terrain_bytes as f64 / (1024.0 * 1024.0));
-    println!("Grass:      {} chunks with masks ({:.1} KB)",
+    println!("Grass:   {} chunks with masks ({:.1} KB)",
         grass_count, grass_bytes as f64 / 1024.0);
-    println!("Rocks:      {} chunks ({:.1} KB)",
-        rock_count, rock_bytes as f64 / 1024.0);
-    println!("Vegetation: {} chunks ({:.1} KB)",
-        vegetation_count, vegetation_bytes as f64 / 1024.0);
 
     // Phase 3: Write manifest with per-layer structure
     let mut y_groups: BTreeMap<i32, usize> = BTreeMap::new();
@@ -400,59 +188,9 @@ fn main() {
         *y_groups.entry(y).or_insert(0) += 1;
     }
 
-    // Collect rock and vegetation chunk lists for manifest
-    // We need to re-scan the terrain directory to find which chunks have rocks/vegetation
-    let rock_chunks: Vec<_> = std::fs::read_dir(&rocks_dir)
-        .map(|entries| {
-            entries.filter_map(|e| {
-                let e = e.ok()?;
-                let binding = e.file_name();
-                let name = binding.to_str()?;
-                if name.starts_with("chunk_") && name.ends_with(".rkc") {
-                    let parts: Vec<_> = name.strip_prefix("chunk_")?
-                        .strip_suffix(".rkc")?
-                        .split('_')
-                        .collect();
-                    if parts.len() == 3 {
-                        return Some(json!({
-                            "x": parts[0].parse::<i32>().ok()?,
-                            "y": parts[1].parse::<i32>().ok()?,
-                            "z": parts[2].parse::<i32>().ok()?,
-                        }));
-                    }
-                }
-                None
-            }).collect()
-        })
-        .unwrap_or_default();
-
-    let vegetation_chunks: Vec<_> = std::fs::read_dir(&vegetation_dir)
-        .map(|entries| {
-            entries.filter_map(|e| {
-                let e = e.ok()?;
-                let binding = e.file_name();
-                let name = binding.to_str()?;
-                if name.starts_with("chunk_") && name.ends_with(".rkc") {
-                    let parts: Vec<_> = name.strip_prefix("chunk_")?
-                        .strip_suffix(".rkc")?
-                        .split('_')
-                        .collect();
-                    if parts.len() == 3 {
-                        return Some(json!({
-                            "x": parts[0].parse::<i32>().ok()?,
-                            "y": parts[1].parse::<i32>().ok()?,
-                            "z": parts[2].parse::<i32>().ok()?,
-                        }));
-                    }
-                }
-                None
-            }).collect()
-        })
-        .unwrap_or_default();
-
     let manifest = json!({
         "name": name,
-        "version": 3,
+        "version": 2,
         "seed": seed,
         "size": size,
         "chunk_size": CHUNK_SIZE,
@@ -482,22 +220,6 @@ fn main() {
                 "directory": "grass",
                 "chunk_count": grass_count,
                 "total_bytes": grass_bytes,
-            },
-            {
-                "name": "rocks",
-                "id": 2,
-                "directory": "rocks",
-                "chunk_count": rock_count,
-                "total_bytes": rock_bytes,
-                "chunks": rock_chunks,
-            },
-            {
-                "name": "vegetation",
-                "id": 3,
-                "directory": "vegetation",
-                "chunk_count": vegetation_count,
-                "total_bytes": vegetation_bytes,
-                "chunks": vegetation_chunks,
             }
         ],
     });
@@ -508,7 +230,7 @@ fn main() {
 
     println!();
     println!("=== Generation Complete ===");
-    println!("Layers: 4 (terrain, grass, rocks, vegetation)");
+    println!("Layers: 2 (terrain, grass)");
     println!("Chunks: {} with geometry (of {} candidates)", terrain_chunks.len(), total);
     println!("Grass:  {} chunks with masks", grass_count);
     println!("Size:   {:.1} MB terrain + {:.1} KB grass on disk",

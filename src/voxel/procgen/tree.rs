@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use glam::Vec3;
 
 use crate::math::Aabb;
+use crate::voxel::sdf::{sdf_capsule, sdf_sphere, encode_normal_rgb565 as encode_sdf_normal};
 use crate::voxel::voxel::{Voxel, rgb565_to_rgb, rgb_to_565};
 use crate::voxel::svo::Octree;
 use crate::voxel::svo::node::OctreeNode;
@@ -58,6 +59,9 @@ pub enum TreeStyle {
     Oak,
     Willow,
     Elm,
+    /// Winter variant — bare branches with no leaves
+    WinterOak,
+    WinterWillow,
 }
 
 /// Crown volume shape for Space Colonization
@@ -226,7 +230,27 @@ impl TreeParams {
             TreeStyle::Oak => Self::oak(),
             TreeStyle::Willow => Self::willow(),
             TreeStyle::Elm => Self::elm(),
+            TreeStyle::WinterOak => Self::winter_oak(),
+            TreeStyle::WinterWillow => Self::winter_willow(),
         }
+    }
+
+    /// Create winter oak — bare branches, no leaves
+    pub fn winter_oak() -> Self {
+        let mut params = Self::oak();
+        params.leaf_voxel = Voxel::EMPTY; // No leaves
+        params.branch_leaf_density = 0.0; // No leaves on branches
+        params.foliage_density = 0.0; // No foliage
+        params
+    }
+
+    /// Create winter willow — drooping bare branches, no leaves
+    pub fn winter_willow() -> Self {
+        let mut params = Self::willow();
+        params.leaf_voxel = Voxel::EMPTY; // No leaves
+        params.branch_leaf_density = 0.0; // No leaves on branches
+        params.foliage_density = 0.0; // No foliage
+        params
     }
 }
 
@@ -294,16 +318,6 @@ fn hash_3d(x: i32, y: i32, z: i32, seed: u32) -> u32 {
     h = h.wrapping_mul(0x45d9f3b);
     h ^= h >> 16;
     h
-}
-
-/// Encode a unit normal vector into RGB565 format (16 bits).
-/// Each component [-1,1] is mapped to its channel: R(5 bits), G(6 bits), B(5 bits).
-/// Shader decodes with decode_bark_normal().
-fn encode_normal_rgb565(n: Vec3) -> u16 {
-    let r5 = ((n.x * 0.5 + 0.5).clamp(0.0, 1.0) * 31.0) as u16;
-    let g6 = ((n.y * 0.5 + 0.5).clamp(0.0, 1.0) * 63.0) as u16;
-    let b5 = ((n.z * 0.5 + 0.5).clamp(0.0, 1.0) * 31.0) as u16;
-    (r5 << 11) | (g6 << 5) | b5
 }
 
 /// Get child octant offset (-1 or +1 for each axis)
@@ -382,8 +396,9 @@ impl TreeVoxelizer {
             skeleton,
             root_size,
             max_depth,
-            // Half a voxel ensures branches at least 1 voxel wide
-            voxel_padding: voxel_size * 0.5,
+            // Full voxel padding ensures branches are at least 2 voxels wide,
+            // eliminating gaps between segments and at branch joints
+            voxel_padding: voxel_size * 1.0,
         }
     }
 
@@ -536,6 +551,7 @@ impl TreeVoxelizer {
     }
 
     /// Evaluate skeleton SDF at a point -- returns bark voxel, leaf voxel, or empty
+    /// Uses proper capsule SDF to eliminate gaps at branch joints
     fn evaluate_at(
         &self,
         point: Vec3,
@@ -544,97 +560,96 @@ impl TreeVoxelizer {
     ) -> Voxel {
         // Check branches first (bark takes priority)
         for seg in branches {
-            let dir = seg.end - seg.start;
-            let len_sq = dir.length_squared();
+            // Use SDF capsule for proper interpolation between endpoints
+            // This eliminates gaps at branch joints
+            let dist = sdf_capsule(point, seg.start, seg.end, 0.0);
 
-            if len_sq < 0.0001 {
-                // Degenerate segment -- treat as sphere
-                let dist = (point - seg.start).length();
-                if dist <= seg.start_radius {
-                    let radial = if dist > 0.001 {
-                        (point - seg.start).normalize()
+            if dist <= 0.0 {
+                // Point is inside or on surface of the capsule
+                // Compute tapered radius at closest point on line segment
+                let dir = seg.end - seg.start;
+                let len_sq = dir.length_squared();
+
+                let (closest, t, dist_to_axis) = if len_sq < 0.0001 {
+                    // Degenerate segment — treat as sphere
+                    (seg.start, 0.0, (point - seg.start).length())
+                } else {
+                    let t = ((point - seg.start).dot(dir) / len_sq).clamp(0.0, 1.0);
+                    let closest = seg.start + dir * t;
+                    let dist_to_axis = (point - closest).length();
+                    (closest, t, dist_to_axis)
+                };
+
+                // Tapered radius along the segment
+                let radius_at_t = seg.start_radius + (seg.end_radius - seg.start_radius) * t;
+
+                // Organic noise: slight radius perturbation
+                let grid = 0.05;
+                let gx = (point.x / grid).floor() as i32;
+                let gy = (point.y / grid).floor() as i32;
+                let gz = (point.z / grid).floor() as i32;
+                let hash = hash_3d(gx, gy, gz, 0xDEADBEEF);
+                let noise = ((hash & 0xFFFF) as f32 / 65535.0 - 0.5) * 0.15 * radius_at_t;
+
+                // Apply voxel padding to ensure continuous coverage
+                let effective_radius = (radius_at_t + noise).max(self.voxel_padding);
+
+                // Check if point is within the effective radius
+                let dist_from_surface = effective_radius - dist_to_axis;
+                if dist_from_surface >= -self.voxel_padding * 0.5 {
+                    // Compute radial normal for shading
+                    let radial = if dist_to_axis > 0.001 {
+                        (point - closest).normalize()
                     } else {
-                        Vec3::Y
+                        // At axis center: use perpendicular to branch direction
+                        let branch_dir = if len_sq < 0.0001 {
+                            Vec3::Y
+                        } else {
+                            dir.normalize()
+                        };
+                        if branch_dir.y.abs() < 0.9 {
+                            branch_dir.cross(Vec3::Y).normalize()
+                        } else {
+                            branch_dir.cross(Vec3::X).normalize()
+                        }
                     };
-                    let normal_color = encode_normal_rgb565(radial);
-                    let dist_frac = ((seg.start_radius - dist) / seg.start_radius.max(0.001) * 254.0 + 1.0).clamp(1.0, 255.0) as u8;
+                    let normal_color = encode_sdf_normal(radial);
+
+                    // SDF flags based on distance from surface
+                    let dist_frac = ((effective_radius - dist_to_axis) / effective_radius.max(0.001) * 254.0 + 1.0).clamp(1.0, 255.0) as u8;
                     return seg.voxel.with_color_and_flags(normal_color, dist_frac);
                 }
-                continue;
-            }
-
-            let t = ((point - seg.start).dot(dir) / len_sq).clamp(0.0, 1.0);
-            let closest = seg.start + dir * t;
-            let dist = (point - closest).length();
-
-            // Tapered radius
-            let radius_at_t = seg.start_radius + (seg.end_radius - seg.start_radius) * t;
-
-            // Organic noise: slight radius perturbation based on position hash
-            let grid = 0.05; // noise grain size
-            let gx = (point.x / grid).floor() as i32;
-            let gy = (point.y / grid).floor() as i32;
-            let gz = (point.z / grid).floor() as i32;
-            let hash = hash_3d(gx, gy, gz, 0xDEADBEEF);
-            let noise = ((hash & 0xFFFF) as f32 / 65535.0 - 0.5) * 0.15 * radius_at_t;
-
-            // Ensure thin branches are at least 1 voxel wide by clamping
-            // minimum effective radius to half a voxel (only affects branches
-            // thinner than the voxel grid — thick branches are unchanged)
-            let effective_radius = (radius_at_t + noise).max(self.voxel_padding);
-            if dist <= effective_radius {
-                // Encode radial normal (from branch axis toward surface) in color field
-                // This gives the shader a precise surface normal for sub-voxel smoothing,
-                // just like terrain encodes gradient normals in its color field
-                let radial = if dist > 0.001 {
-                    (point - closest).normalize()
-                } else {
-                    // At branch center: use arbitrary perpendicular to branch direction
-                    let branch_dir = dir.normalize();
-                    if branch_dir.y.abs() < 0.9 {
-                        branch_dir.cross(Vec3::Y).normalize()
-                    } else {
-                        branch_dir.cross(Vec3::X).normalize()
-                    }
-                };
-                let normal_color = encode_normal_rgb565(radial);
-
-                // SDF flags based on actual geometry radius for sub-voxel refinement
-                let geom_radius = radius_at_t + noise;
-                let dist_frac = ((geom_radius - dist) / geom_radius.max(0.001) * 254.0 + 1.0).clamp(1.0, 255.0) as u8;
-                return seg.voxel.with_color_and_flags(normal_color, dist_frac);
             }
         }
 
         // Check foliage clouds
         for cloud in clouds {
-            let dist = (point - cloud.center).length();
-            if dist > cloud.radius {
-                continue;
-            }
+            // Use SDF sphere for foliage
+            let dist = sdf_sphere(point, cloud.center, cloud.radius);
 
-            let normalized_dist = dist / cloud.radius;
-            let falloff = 1.0 - normalized_dist * normalized_dist;
-            let local_density = cloud.density * falloff;
+            if dist <= 0.0 {
+                let dist_from_center = (point - cloud.center).length();
+                let normalized_dist = dist_from_center / cloud.radius;
+                let falloff = 1.0 - normalized_dist * normalized_dist;
+                let local_density = cloud.density * falloff;
 
-            let grid_size = cloud.radius * 0.08;
-            let gx = (point.x / grid_size).floor() as i32;
-            let gy = (point.y / grid_size).floor() as i32;
-            let gz = (point.z / grid_size).floor() as i32;
-            let hash = hash_3d(gx, gy, gz, cloud.seed);
-            let hash_float = (hash & 0xFFFF) as f32 / 65535.0;
+                let grid_size = cloud.radius * 0.08;
+                let gx = (point.x / grid_size).floor() as i32;
+                let gy = (point.y / grid_size).floor() as i32;
+                let gz = (point.z / grid_size).floor() as i32;
+                let hash = hash_3d(gx, gy, gz, cloud.seed);
+                let hash_float = (hash & 0xFFFF) as f32 / 65535.0;
 
-            if hash_float < local_density {
-                // Encode cloud-center-to-point normal in color field (like bark radial)
-                let leaf_normal = if dist > 0.001 {
-                    (point - cloud.center).normalize()
-                } else {
-                    Vec3::Y
-                };
-                let normal_color = encode_normal_rgb565(leaf_normal);
-                // Encode distance-to-cloud-center in flags: 0=edge, 255=center
-                let dist_flag = ((1.0 - normalized_dist) * 255.0).clamp(0.0, 255.0) as u8;
-                return cloud.voxel.with_color_and_flags(normal_color, dist_flag);
+                if hash_float < local_density {
+                    let leaf_normal = if dist_from_center > 0.001 {
+                        (point - cloud.center).normalize()
+                    } else {
+                        Vec3::Y
+                    };
+                    let normal_color = encode_sdf_normal(leaf_normal);
+                    let dist_flag = ((1.0 - normalized_dist) * 255.0).clamp(0.0, 255.0) as u8;
+                    return cloud.voxel.with_color_and_flags(normal_color, dist_flag);
+                }
             }
         }
 

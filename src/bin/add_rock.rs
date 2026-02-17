@@ -1,8 +1,7 @@
-//! Add one or more trees to an existing world for visual testing.
+//! Add one or more rocks to an existing world by merging into terrain chunks.
 //!
 //! Usage:
-//!   cargo run --release --bin add_tree -- --world grass_test
-//!   cargo run --release --bin add_tree -- --world forest_world --count 50 --radius 50
+//!   cargo run --release --bin add_rock -- --world my_world --count 30 --radius 40
 
 use glam::Vec3;
 
@@ -10,7 +9,7 @@ use rktri::generation::{GenerationConfig, GenerationPipeline, BiomeNoiseGenerato
 use rktri::mask::MaskBuilder;
 use rktri::terrain::generator::TerrainParams;
 use rktri::voxel::chunk::{ChunkCoord, CHUNK_SIZE};
-use rktri::voxel::procgen::{TreeGenerator, TreeStyle};
+use rktri::voxel::rock_library::{RockGenerator, RockParams};
 use rktri::voxel::svo::adaptive::AdaptiveOctreeBuilder;
 use rktri::voxel::tree_merge::{TreeInstance, MultiTreeClassifier};
 use rktri::streaming::disk_io;
@@ -41,32 +40,31 @@ impl SimpleRng {
     }
 }
 
-const TREE_STYLES: &[TreeStyle] = &[
-    TreeStyle::Oak,
-    TreeStyle::Willow,
-    TreeStyle::Elm,
-    TreeStyle::WinterOak,
-    TreeStyle::WinterWillow,
+/// Available rock size presets
+const ROCK_PRESETS: &[(&str, fn() -> RockParams, f32)] = &[
+    ("small", RockParams::small_boulder, 0.25),
+    ("medium", RockParams::medium_rock, 0.5),
 ];
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
     let world_name = args.iter()
         .position(|a| a == "--world")
         .and_then(|i| args.get(i + 1))
-        .expect("Usage: add_tree --world <name> [--count N] [--radius R]");
+        .expect("Usage: add_rock --world <name> [--count N] [--radius R]");
 
     let count = args.iter()
         .position(|a| a == "--count")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+        .unwrap_or(10);
 
     let radius = args.iter()
         .position(|a| a == "--radius")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok())
-        .unwrap_or(50.0);
+        .unwrap_or(40.0);
 
     let world_dir = PathBuf::from(format!("assets/worlds/{}", world_name));
     let manifest_path = world_dir.join("manifest.json");
@@ -101,49 +99,56 @@ fn main() {
     let size = manifest["size"].as_f64().unwrap_or(200.0) as f32;
     let center = size / 2.0;
 
-    // Generate random tree positions
-    let mut rng = SimpleRng::new(12345);
-    let mut tree_positions: Vec<(Vec3, TreeStyle)> = Vec::with_capacity(count);
+    // Generate random rock positions with sizes
+    let mut rng = SimpleRng::new(54321);
+    let mut rock_instances: Vec<TreeInstance> = Vec::with_capacity(count);
+    let mut combined_min = Vec3::splat(f32::MAX);
+    let mut combined_max = Vec3::splat(f32::MIN);
 
-    println!("=== Adding {} trees to world '{}' ===", count, world_name);
+    let embed_ratio = 0.35; // 35% embed
+
+    println!("=== Adding {} rocks to world '{}' ===", count, world_name);
+    println!("Distribution radius: {}m", radius);
 
     for i in 0..count {
         // Random position within radius around center
         let angle = rng.gen_f32() * std::f32::consts::TAU;
         let dist = rng.gen_f32() * radius;
-        let tree_x = center + angle.cos() * dist;
-        let tree_z = center + angle.sin() * dist;
+        let rock_x = center + angle.cos() * dist;
+        let rock_z = center + angle.sin() * dist;
 
-        let terrain_height = pipeline.height_at(tree_x, tree_z);
-        let tree_pos = Vec3::new(tree_x, terrain_height, tree_z);
+        let terrain_height = pipeline.height_at(rock_x, rock_z);
 
-        // Pick random tree style
-        let style = TREE_STYLES[rng.gen_range(0..TREE_STYLES.len())];
+        // Pick random rock size preset
+        let preset_idx = rng.gen_range(0..ROCK_PRESETS.len());
+        let (name, params_fn, base_size) = ROCK_PRESETS[preset_idx];
 
-        if i < 5 || count <= 10 {
-            println!("Tree {}: style={:?}, pos=({:.1}, {:.1}, {:.1})", i, style, tree_pos.x, tree_pos.y, tree_pos.z);
+        // Add some variation to the size (0.8x to 1.2x of base)
+        let size_variation = 0.8 + rng.gen_f32() * 0.4;
+        let rock_size = base_size * size_variation;
+
+        // Position rock: embed bottom 35% into terrain
+        let rock_pos = Vec3::new(rock_x, terrain_height - (rock_size * embed_ratio), rock_z);
+
+        if i < 5 {
+            println!("Rock {}: {} ({:.2}m), pos=({:.1}, {:.1}, {:.1})",
+                i, name, rock_size, rock_pos.x, rock_pos.y, rock_pos.z);
         } else if i == 5 {
-            println!("  ... ({} more trees)", count - 5);
+            println!("  ... ({} more rocks)", count - 5);
         }
 
-        tree_positions.push((tree_pos, style));
-    }
+        // Generate rock octree
+        let params = params_fn();
+        let mut rock_gen = RockGenerator::with_params(42 + i as u64, params);
+        let rock_octree = rock_gen.generate(rock_size);
 
-    // Collect all tree AABBs to determine affected chunks
-    let mut tree_instances: Vec<TreeInstance> = Vec::with_capacity(count);
-    let mut combined_min = Vec3::splat(f32::MAX);
-    let mut combined_max = Vec3::splat(f32::MIN);
+        let rock_instance = TreeInstance::new(rock_octree, rock_pos);
+        let rock_aabb = rock_instance.world_aabb();
 
-    for (tree_pos, style) in &tree_positions {
-        let mut tree_gen = TreeGenerator::from_style(42, *style);
-        let tree_octree = tree_gen.generate(16.0, 7);
-        let tree_instance = TreeInstance::new(tree_octree, *tree_pos);
-        let tree_aabb = tree_instance.world_aabb();
+        combined_min = combined_min.min(rock_aabb.min);
+        combined_max = combined_max.max(rock_aabb.max);
 
-        combined_min = combined_min.min(tree_aabb.min);
-        combined_max = combined_max.max(tree_aabb.max);
-
-        tree_instances.push(tree_instance);
+        rock_instances.push(rock_instance);
     }
 
     println!("Combined AABB: ({:.1},{:.1},{:.1}) -> ({:.1},{:.1},{:.1})",
@@ -166,13 +171,12 @@ fn main() {
     let mut chunks_written = 0;
     let mut new_chunks = Vec::new();
 
-    // Extract sea_level before the loop to ensure config doesn't need to live into the loop
     let sea_level = config.terrain_params.sea_level;
 
     for cx in min_cx..=max_cx {
         for cy in min_cy..=max_cy {
             for cz in min_cz..=max_cz {
-                let coord = ChunkCoord::new(cx, cy, cz);
+                let _coord = ChunkCoord::new(cx, cy, cz);
                 let origin = Vec3::new(
                     cx as f32 * chunk_f,
                     cy as f32 * chunk_f,
@@ -190,26 +194,26 @@ fn main() {
                 let terrain_classifier = MaskDrivenTerrainClassifier::new(
                     pipeline.terrain(), &biome_mask, origin, voxel_size);
 
-                // Wrap with all trees
-                let mut tree_classifier = MultiTreeClassifier::new(&terrain_classifier);
-                for tree_instance in &tree_instances {
-                    // Check if tree AABB overlaps this chunk before adding
-                    let tree_aabb = tree_instance.world_aabb();
+                // Wrap with all rocks
+                let mut rock_classifier = MultiTreeClassifier::new(&terrain_classifier);
+                for rock_instance in &rock_instances {
+                    // Check if rock AABB overlaps this chunk before adding
+                    let rock_aabb = rock_instance.world_aabb();
                     let chunk_min = origin;
                     let chunk_max = origin + Vec3::splat(chunk_f);
 
-                    let overlaps = tree_aabb.min.x < chunk_max.x && tree_aabb.max.x > chunk_min.x
-                        && tree_aabb.min.y < chunk_max.y && tree_aabb.max.y > chunk_min.y
-                        && tree_aabb.min.z < chunk_max.z && tree_aabb.max.z > chunk_min.z;
+                    let overlaps = rock_aabb.min.x < chunk_max.x && rock_aabb.max.x > chunk_min.x
+                        && rock_aabb.min.y < chunk_max.y && rock_aabb.max.y > chunk_min.y
+                        && rock_aabb.min.z < chunk_max.z && rock_aabb.max.z > chunk_min.z;
 
                     if overlaps {
-                        tree_classifier.add_tree(tree_instance.clone());
+                        rock_classifier.add_tree(rock_instance.clone());
                     }
                 }
 
                 // Build chunk octree
                 let builder = AdaptiveOctreeBuilder::new(128);
-                let octree = builder.build(&tree_classifier, origin, chunk_f);
+                let octree = builder.build(&rock_classifier, origin, chunk_f);
 
                 let node_count = octree.node_count();
                 if node_count == 0 {
@@ -262,6 +266,8 @@ fn main() {
     }
 
     println!();
-    println!("Done! {} chunks written.", chunks_written);
+    println!("=== Done ===");
+    println!("Added {} rocks, wrote {} chunks", count, chunks_written);
+    println!();
     println!("Run: cargo run --release --bin rktri -- --world {}", world_name);
 }
