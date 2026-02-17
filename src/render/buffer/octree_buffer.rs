@@ -13,6 +13,19 @@ use crate::voxel::streaming::feedback::MAX_FEEDBACK_REQUESTS;
 /// Maximum number of chunks that can be uploaded
 pub const MAX_CHUNKS: u32 = 8192;
 
+/// Maximum total layer indices across all grid cells
+pub const MAX_LAYER_INDICES: u32 = 65536;
+
+/// Descriptor for layers at a single grid cell (8 bytes, matches WGSL layout)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct LayerDescriptor {
+    /// First index in layer_data for this cell
+    pub base_index: u32,
+    /// How many layers at this cell (0 = empty)
+    pub layer_count: u32,
+}
+
 /// Per-chunk metadata for the GPU (32 bytes, matches WGSL layout)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -72,8 +85,10 @@ pub struct OctreeBuffer {
     feedback_header_buffer: wgpu::Buffer,
     /// Storage buffer for feedback requests (brick IDs)
     feedback_requests_buffer: wgpu::Buffer,
-    /// Storage buffer for 3D chunk grid (maps chunk coords → chunk index)
+    /// Storage buffer for 3D chunk grid (maps chunk coords → LayerDescriptor)
     chunk_grid_buffer: wgpu::Buffer,
+    /// Storage buffer for layer data (flat array of octree indices)
+    layer_data_buffer: wgpu::Buffer,
     /// Storage buffer for per-chunk grass mask metadata
     grass_mask_info_buffer: wgpu::Buffer,
     /// Storage buffer for packed grass mask nodes (all chunks)
@@ -149,12 +164,19 @@ impl OctreeBuffer {
             mapped_at_creation: false,
         });
 
-        // Chunk grid: 3D lookup table mapping chunk coordinates to chunk indices.
+        // Chunk grid: 3D lookup table mapping chunk coordinates to LayerDescriptor.
         // Preallocate for a reasonable world size; resized via upload_chunk_grid().
-        // Minimum 4 bytes so the binding is valid even before grid data is uploaded.
         let chunk_grid_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk_grid"),
-            size: 4, // Will be recreated when grid is uploaded
+            size: 8, // LayerDescriptor = 8 bytes (2x u32)
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Layer data: flat array of octree indices for all layers at all cells
+        let layer_data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("layer_data"),
+            size: 4, // Minimum; recreated when grid is uploaded
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -239,9 +261,20 @@ impl OctreeBuffer {
                     },
                     count: None,
                 },
-                // binding 5: chunk grid (3D lookup: chunk coord → chunk index)
+                // binding 5: chunk grid (3D lookup: chunk coord → LayerDescriptor)
                 wgpu::BindGroupLayoutEntry {
                     binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // binding 9: layer data (flat array of octree indices)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -315,6 +348,10 @@ impl OctreeBuffer {
                     resource: chunk_grid_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: layer_data_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
                     binding: 6,
                     resource: grass_mask_info_buffer.as_entire_binding(),
                 },
@@ -336,6 +373,7 @@ impl OctreeBuffer {
             feedback_header_buffer,
             feedback_requests_buffer,
             chunk_grid_buffer,
+            layer_data_buffer,
             grass_mask_info_buffer,
             grass_mask_node_buffer,
             grass_mask_value_buffer,
@@ -659,28 +697,42 @@ impl OctreeBuffer {
 
     /// Upload a 3D chunk grid mapping chunk coordinates to chunk indices.
     ///
-    /// `grid_data` is a flat array of u32 indexed as:
+    /// Upload chunk grid and layer data.
+    ///
+    /// `grid_data` is a flat array of LayerDescriptor indexed as:
     ///   `(x - min_x) + (y - min_y) * size_x + (z - min_z) * size_x * size_y`
-    /// where 0xFFFFFFFF means empty (no chunk at that coordinate).
+    /// layer_data contains all octree indices for all layers at all cells.
     pub fn upload_chunk_grid(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        grid_data: &[u32],
+        grid_data: &[LayerDescriptor],
+        layer_data: &[u32],
     ) {
-        let grid_size = (grid_data.len() as u64) * 4;
-        let grid_size = grid_size.max(4); // Minimum 4 bytes
-
         // Recreate grid buffer with correct size
+        let grid_size = (grid_data.len() * std::mem::size_of::<LayerDescriptor>()) as u64;
         self.chunk_grid_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk_grid"),
-            size: grid_size,
+            size: grid_size.max(8),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         if !grid_data.is_empty() {
             queue.write_buffer(&self.chunk_grid_buffer, 0, bytemuck::cast_slice(grid_data));
+        }
+
+        // Recreate layer data buffer
+        let layer_data_size = (layer_data.len() * 4) as u64;
+        self.layer_data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("layer_data"),
+            size: layer_data_size.max(4),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        if !layer_data.is_empty() {
+            queue.write_buffer(&self.layer_data_buffer, 0, bytemuck::cast_slice(layer_data));
         }
 
         self.rebuild_bind_group(device);
@@ -789,6 +841,10 @@ impl OctreeBuffer {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: self.chunk_grid_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: self.layer_data_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,

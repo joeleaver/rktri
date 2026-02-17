@@ -71,7 +71,13 @@ struct VoxelBrick {
 @group(1) @binding(0) var<storage, read> nodes: array<OctreeNode>;
 @group(1) @binding(1) var<storage, read> bricks: array<VoxelBrick>;
 @group(1) @binding(4) var<storage, read> chunk_infos: array<ChunkInfo>;
-@group(1) @binding(5) var<storage, read> chunk_grid: array<u32>;
+// Layer descriptor: first index in layer_data + count of layers at this cell
+struct LayerDescriptor {
+    base_index: u32,
+    layer_count: u32,
+}
+@group(1) @binding(5) var<storage, read> chunk_grid: array<LayerDescriptor>;
+@group(1) @binding(9) var<storage, read> layer_data: array<u32>;
 
 // Group 2: G-buffer inputs (for world position reconstruction)
 @group(2) @binding(0) var t_depth: texture_2d<f32>;
@@ -133,8 +139,8 @@ fn ray_aabb_intersect(
     return vec2<f32>(t_near, t_far);
 }
 
-// Look up chunk index from the 3D grid. Returns 0xFFFFFFFF if empty or out of bounds.
-fn grid_lookup(cx: i32, cy: i32, cz: i32) -> u32 {
+// Look up layer descriptor from the 3D grid.
+fn grid_lookup(cx: i32, cy: i32, cz: i32) -> LayerDescriptor {
     let gx = cx - shadow_params.grid_min_x;
     let gy = cy - shadow_params.grid_min_y;
     let gz = cz - shadow_params.grid_min_z;
@@ -142,10 +148,21 @@ fn grid_lookup(cx: i32, cy: i32, cz: i32) -> u32 {
         u32(gx) >= shadow_params.grid_size_x ||
         u32(gy) >= shadow_params.grid_size_y ||
         u32(gz) >= shadow_params.grid_size_z) {
-        return 0xFFFFFFFFu;
+        var desc: LayerDescriptor;
+        desc.base_index = 0u;
+        desc.layer_count = 0u;
+        return desc;
     }
     let idx = u32(gx) + u32(gy) * shadow_params.grid_size_x + u32(gz) * shadow_params.grid_size_x * shadow_params.grid_size_y;
     return chunk_grid[idx];
+}
+
+// Get chunk index at a specific layer offset within a grid cell
+fn get_layer_chunk_index(desc: LayerDescriptor, layer_offset: u32) -> u32 {
+    if (layer_offset >= desc.layer_count) {
+        return 0xFFFFFFFFu;
+    }
+    return layer_data[desc.base_index + layer_offset];
 }
 
 // Trace a single chunk for shadow opacity. Returns opacity contribution.
@@ -332,14 +349,20 @@ fn trace_shadow_ray(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> f32 {
 
     let max_steps = shadow_params.grid_size_x + shadow_params.grid_size_y + shadow_params.grid_size_z;
     for (var iter = 0u; iter < max_steps; iter++) {
-        let chunk_idx = grid_lookup(cell.x, cell.y, cell.z);
+        let layer_desc = grid_lookup(cell.x, cell.y, cell.z);
 
-        if (chunk_idx != 0xFFFFFFFFu) {
-            let r = trace_shadow_chunk(ray_origin, ray_inv_dir, chunk_idx, shadow_opacity, leaf_hits);
-            shadow_opacity = r.x;
-            leaf_hits = u32(r.y);
-            if (shadow_opacity >= 0.95) {
-                return shadow_opacity;
+        // Check all layers at this cell
+        if (layer_desc.layer_count > 0u) {
+            for (var layer_idx = 0u; layer_idx < layer_desc.layer_count; layer_idx++) {
+                let chunk_idx = get_layer_chunk_index(layer_desc, layer_idx);
+                if (chunk_idx != 0xFFFFFFFFu) {
+                    let r = trace_shadow_chunk(ray_origin, ray_inv_dir, chunk_idx, shadow_opacity, leaf_hits);
+                    shadow_opacity = r.x;
+                    leaf_hits = u32(r.y);
+                    if (shadow_opacity >= 0.95) {
+                        return shadow_opacity;
+                    }
+                }
             }
         }
 

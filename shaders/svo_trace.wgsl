@@ -149,7 +149,13 @@ struct FeedbackData {
 @group(1) @binding(2) var<storage, read_write> feedback_header: FeedbackData;
 @group(1) @binding(3) var<storage, read_write> feedback_requests: array<u32>;
 @group(1) @binding(4) var<storage, read> chunk_infos: array<ChunkInfo>;
-@group(1) @binding(5) var<storage, read> chunk_grid: array<u32>;
+// Layer descriptor: first index in layer_data + count of layers at this cell
+struct LayerDescriptor {
+    base_index: u32,
+    layer_count: u32,
+}
+@group(1) @binding(5) var<storage, read> chunk_grid: array<LayerDescriptor>;
+@group(1) @binding(9) var<storage, read> layer_data: array<u32>;
 @group(1) @binding(6) var<storage, read> grass_mask_info: array<GrassMaskInfo>;
 @group(1) @binding(7) var<storage, read> grass_mask_nodes: array<GrassMaskNode>;
 @group(1) @binding(8) var<storage, read> grass_mask_values: array<u32>;
@@ -337,10 +343,12 @@ fn terrain_color_variation(world_pos: vec3<f32>, material_id: u32) -> vec3<f32> 
     return clamp(base * brightness + warm, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
-// Base color for terrain biome surfaces (IDs 7-15)
+// Base color for terrain biome surfaces (IDs 4, 7-15)
 // Color field stores gradient, so visual color comes from this LUT
 fn terrain_base_color(material_id: u32) -> vec3<f32> {
     switch material_id {
+        case 4u:  { return vec3<f32>(0.35, 0.33, 0.32); } // Stone - dark grey-brown
+        case 20u: { return vec3<f32>(0.35, 0.33, 0.32); } // Rock - same as stone for now
         case 7u:  { return vec3<f32>(0.93, 0.84, 0.69); } // Beach sand
         case 8u:  { return vec3<f32>(0.93, 0.79, 0.69); } // Desert sand
         case 9u:  { return vec3<f32>(0.39, 0.71, 0.31); } // Grassland
@@ -1657,7 +1665,7 @@ fn sample_grass_mask(chunk_idx: u32, world_pos: vec3<f32>) -> u32 {
 
 
 // Look up chunk index from the 3D grid. Returns 0xFFFFFFFF if empty or out of bounds.
-fn grid_lookup(cx: i32, cy: i32, cz: i32) -> u32 {
+fn grid_lookup(cx: i32, cy: i32, cz: i32) -> LayerDescriptor {
     let gx = cx - params.grid_min_x;
     let gy = cy - params.grid_min_y;
     let gz = cz - params.grid_min_z;
@@ -1665,10 +1673,21 @@ fn grid_lookup(cx: i32, cy: i32, cz: i32) -> u32 {
         u32(gx) >= params.grid_size_x ||
         u32(gy) >= params.grid_size_y ||
         u32(gz) >= params.grid_size_z) {
-        return 0xFFFFFFFFu;
+        var desc: LayerDescriptor;
+        desc.base_index = 0u;
+        desc.layer_count = 0u;
+        return desc;
     }
     let idx = u32(gx) + u32(gy) * params.grid_size_x + u32(gz) * params.grid_size_x * params.grid_size_y;
     return chunk_grid[idx];
+}
+
+// Get chunk index at a specific layer offset within a grid cell
+fn get_layer_chunk_index(desc: LayerDescriptor, layer_offset: u32) -> u32 {
+    if (layer_offset >= desc.layer_count) {
+        return 0xFFFFFFFFu;
+    }
+    return layer_data[desc.base_index + layer_offset];
 }
 
 // Trace ray through chunk grid using DDA (Digital Differential Analyzer).
@@ -1748,17 +1767,44 @@ fn trace_all_chunks(ray_origin: vec3<f32>, ray_dir: vec3<f32>, pixel_hash: f32) 
     // March through grid cells (max iterations = grid diagonal)
     let max_steps = params.grid_size_x + params.grid_size_y + params.grid_size_z;
     for (var iter = 0u; iter < max_steps; iter++) {
-        // Look up chunk at this cell
-        let chunk_idx = grid_lookup(cell.x, cell.y, cell.z);
+        // Look up layer descriptor at this cell
+        let layer_desc = grid_lookup(cell.x, cell.y, cell.z);
 
-        if (chunk_idx != 0xFFFFFFFFu) {
-            let chunk_result = trace_chunk_octree(
-                ray_origin, ray_dir, ray_inv_dir, chunk_idx, pixel_hash, result.t
-            );
-            if (chunk_result.hit && chunk_result.t < result.t) {
-                result = chunk_result;
-                // DDA marches front-to-back, so first hit is closest — done
-                return result;
+        // Check all layers at this cell
+        // If multiple layers have hits, prefer higher layer_id (rocks over terrain)
+        if (layer_desc.layer_count > 0u) {
+            var best_hit_in_cell: HitResult;
+            best_hit_in_cell.hit = false;
+            best_hit_in_cell.t = camera.far;
+            var best_layer_id: u32 = 0u;
+
+            for (var layer_idx = 0u; layer_idx < layer_desc.layer_count; layer_idx++) {
+                let chunk_idx = get_layer_chunk_index(layer_desc, layer_idx);
+                if (chunk_idx != 0xFFFFFFFFu) {
+                    // Get layer_id from chunk info
+                    let chunk_info = chunk_infos[chunk_idx];
+                    let this_layer_id = chunk_info.layer_id;
+
+                    let chunk_result = trace_chunk_octree(
+                        ray_origin, ray_dir, ray_inv_dir, chunk_idx, pixel_hash, result.t
+                    );
+                    if (chunk_result.hit) {
+                        // If this is closer than current best, or same distance but higher layer
+                        let is_closer = chunk_result.t < best_hit_in_cell.t;
+                        let is_same_dist = abs(chunk_result.t - best_hit_in_cell.t) < 0.001;
+                        let is_higher_layer = this_layer_id > best_layer_id;
+
+                        if (!best_hit_in_cell.hit || is_closer || (is_same_dist && is_higher_layer)) {
+                            best_hit_in_cell = chunk_result;
+                            best_layer_id = this_layer_id;
+                        }
+                    }
+                }
+            }
+
+            // If we found a hit in this cell that's better than global best, update
+            if (best_hit_in_cell.hit && best_hit_in_cell.t < result.t) {
+                result = best_hit_in_cell;
             }
         }
 

@@ -551,3 +551,28 @@ mod tests {
         assert_eq!(path, PathBuf::from("/tmp/grass/chunk_5_10_-3.rkm"));
     }
 }
+
+#[cfg(test)]
+mod rock_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_load_rock_chunk() {
+        let rock_path = PathBuf::from("/home/joe/dev/rktri/assets/worlds/test_rocks/rocks/chunk_0_10_0.rkc");
+        
+        if !rock_path.exists() {
+            eprintln!("Rock file not found, skipping");
+            return;
+        }
+        
+        let compressed = std::fs::read(&rock_path).expect("Failed to read rock file");
+        println!("Compressed size: {} bytes", compressed.len());
+        
+        let chunk = decompress_svdag_chunk(&compressed).expect("Failed to decompress");
+        println!("Loaded rock chunk: {} nodes, {} bricks", 
+            chunk.octree.node_count(), chunk.octree.brick_count());
+        
+        assert!(chunk.octree.brick_count() > 0, "Expected bricks in rock chunk");
+    }
+}

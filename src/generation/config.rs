@@ -15,6 +15,8 @@ pub struct GenerationConfig {
     pub grass_mask_depth: u8,
     /// Max depth for rock mask octree (depth 4 = 16 cells/side = 0.25m resolution).
     pub rock_mask_depth: u8,
+    /// Max depth for tree mask octree (depth 4 = 16 cells/side = 0.25m resolution).
+    pub tree_mask_depth: u8,
 }
 
 impl Default for GenerationConfig {
@@ -25,6 +27,7 @@ impl Default for GenerationConfig {
             biome_mask_depth: 3,
             grass_mask_depth: 5,
             rock_mask_depth: 4,
+            tree_mask_depth: 4,
         }
     }
 }
@@ -38,6 +41,7 @@ impl GenerationConfig {
             biome_mask_depth: 3,
             grass_mask_depth: 5,
             rock_mask_depth: 4,
+            tree_mask_depth: 4,
         }
     }
 }

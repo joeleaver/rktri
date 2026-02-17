@@ -106,6 +106,9 @@ struct RenderResources {
     grid_size: [u32; 3],
     #[allow(dead_code)]
     streaming: StreamingManager,
+    // Debug: loaded chunk info for GetChunkInfo command
+    loaded_chunks: std::collections::HashMap<(i32, i32, i32), ChunkDebugInfo>,
+    loaded_chunks_grass: std::collections::HashMap<(i32, i32, i32), GrassDebugInfo>,
 }
 
 impl RenderResources {
@@ -114,6 +117,7 @@ impl RenderResources {
 
         // Only path: load pre-generated v3 world from disk (SVDAG pre-compressed)
         struct CompressedEntry {
+            coord: (i32, i32, i32),
             world_min: [f32; 3],
             root_size: f32,
             layer_id: u32,
@@ -123,18 +127,28 @@ impl RenderResources {
         log::info!("Loading pre-generated v3 world from: {}", world_path.display());
         let chunks = Self::load_chunks_from_disk(world_path, view_distance);
 
-        let compressed_entries: Vec<CompressedEntry> = chunks.iter().map(|(coord, octree)| {
-            CompressedEntry {
-                world_min: [
-                    coord.x as f32 * CHUNK_SIZE as f32,
-                    coord.y as f32 * CHUNK_SIZE as f32,
-                    coord.z as f32 * CHUNK_SIZE as f32,
-                ],
-                root_size: octree.root_size(),
-                layer_id: 0, // TERRAIN
+        // Keep layers separate - each chunk is stored with its actual layer_id
+        // The raycaster will check all layer indices at each grid cell
+        let mut merged_entries: Vec<CompressedEntry> = Vec::with_capacity(chunks.len());
+
+        for (coord, octree, layer_id) in &chunks {
+            let world_min = [
+                coord.x as f32 * CHUNK_SIZE as f32,
+                coord.y as f32 * CHUNK_SIZE as f32,
+                coord.z as f32 * CHUNK_SIZE as f32,
+            ];
+            let root_size = octree.root_size();
+
+            merged_entries.push(CompressedEntry {
+                coord: (coord.x, coord.y, coord.z),
+                world_min,
+                root_size,
+                layer_id: *layer_id,
                 octree: octree.clone(),
-            }
-        }).collect();
+            });
+        }
+
+        let compressed_entries = merged_entries;
 
         // Sum up total nodes/bricks for buffer allocation
         let mut total_nodes = 0usize;
@@ -160,6 +174,7 @@ impl RenderResources {
 
         // Incrementally upload each chunk to GPU
         let mut all_chunk_infos: Vec<rktri::render::buffer::octree_buffer::GpuChunkInfo> = Vec::with_capacity(compressed_entries.len());
+        let mut loaded_chunks: std::collections::HashMap<(i32, i32, i32), ChunkDebugInfo> = std::collections::HashMap::new();
         for entry in &compressed_entries {
             let info = octree_buffer.upload_chunk_incremental(
                 queue,
@@ -169,6 +184,11 @@ impl RenderResources {
                 entry.layer_id,
                 0,
             );
+            loaded_chunks.insert(entry.coord, ChunkDebugInfo {
+                node_count: entry.octree.node_count() as u32,
+                brick_count: entry.octree.brick_count() as u32,
+                world_min: entry.world_min,
+            });
             all_chunk_infos.push(info);
         }
 
@@ -179,15 +199,22 @@ impl RenderResources {
         // Write ALL chunk infos to buffer once (grid-based ray marching uses static indices)
         octree_buffer.update_chunk_infos(queue, &all_chunk_infos);
 
-        // Build 3D chunk grid: maps chunk coordinates → chunk index for DDA ray marching
+        // Build 3D chunk grid: maps chunk coordinates → LayerDescriptor for DDA ray marching
         let chunk_size_f = rktri::voxel::chunk::CHUNK_SIZE as f32;
-        let (grid_min, grid_size, grid_data) = Self::build_chunk_grid(&all_chunk_infos, chunk_size_f);
-        octree_buffer.upload_chunk_grid(device, queue, &grid_data);
-        log::info!("Chunk grid: min={:?}, size={:?}, cells={}", grid_min, grid_size,
-            grid_size[0] as usize * grid_size[1] as usize * grid_size[2] as usize);
+        let (grid_min, grid_size, grid_data, layer_data) = Self::build_chunk_grid(&all_chunk_infos, chunk_size_f);
+        octree_buffer.upload_chunk_grid(device, queue, &grid_data, &layer_data);
+
+        // Debug: count cells with multiple layers
+        let multi_layer_cells = grid_data.iter().filter(|d| d.layer_count > 1).count();
+        let max_layers = grid_data.iter().map(|d| d.layer_count).max().unwrap_or(0);
+        log::info!("Chunk grid: min={:?}, size={:?}, cells={}, layer_indices={}, multi_layer_cells={}, max_layers_per_cell={}",
+            grid_min, grid_size,
+            grid_size[0] as usize * grid_size[1] as usize * grid_size[2] as usize,
+            layer_data.len(), multi_layer_cells, max_layers);
 
         // Load and upload grass masks
         let grass_masks_map = Self::load_grass_masks_from_disk(world_path);
+        let mut loaded_chunks_grass: std::collections::HashMap<(i32, i32, i32), GrassDebugInfo> = std::collections::HashMap::new();
         if !grass_masks_map.is_empty() {
             // Build per-chunk mask array matching compressed_entries order
             let chunk_size_i = rktri::voxel::chunk::CHUNK_SIZE as f32;
@@ -204,6 +231,15 @@ impl RenderResources {
 
             // Pack masks to GPU format and upload
             let (infos, nodes, values) = rktri::render::buffer::pack_grass_masks(&masks_ordered);
+
+            // Track grass info per chunk
+            for (i, entry) in compressed_entries.iter().enumerate() {
+                if let Some(mask) = masks_ordered[i] {
+                    loaded_chunks_grass.insert(entry.coord, GrassDebugInfo {
+                        node_count: mask.node_count() as u32,
+                    });
+                }
+            }
 
             octree_buffer.upload_grass_masks(device, queue, &infos, &nodes, &values);
         }
@@ -365,18 +401,22 @@ impl RenderResources {
             grid_min,
             grid_size,
             streaming,
+            loaded_chunks,
+            loaded_chunks_grass,
         }
     }
 
-    /// Build a 3D grid mapping chunk coordinates to chunk indices.
-    /// Returns (grid_min, grid_size, grid_data) where grid_data[i] is the chunk index
-    /// or 0xFFFFFFFF for empty cells.
+    /// Build a 3D grid mapping chunk coordinates to LayerDescriptor + layer_data.
+    /// Returns (grid_min, grid_size, grid_data, layer_data).
+    /// Each grid cell stores a descriptor pointing into layer_data where octree indices are stored.
     fn build_chunk_grid(
         chunk_infos: &[rktri::render::buffer::octree_buffer::GpuChunkInfo],
         chunk_size: f32,
-    ) -> ([i32; 3], [u32; 3], Vec<u32>) {
+    ) -> ([i32; 3], [u32; 3], Vec<rktri::render::buffer::LayerDescriptor>, Vec<u32>) {
+        use rktri::render::buffer::LayerDescriptor;
+
         if chunk_infos.is_empty() {
-            return ([0; 3], [1, 1, 1], vec![0xFFFFFFFF]);
+            return ([0; 3], [1, 1, 1], vec![LayerDescriptor { base_index: 0, layer_count: 0 }], vec![]);
         }
 
         // Find bounds of all chunk coordinates
@@ -401,7 +441,33 @@ impl RenderResources {
         let size_z = (max_coord[2] - min_coord[2] + 1) as u32;
         let total_cells = size_x as usize * size_y as usize * size_z as usize;
 
-        let mut grid = vec![0xFFFFFFFFu32; total_cells];
+        // First pass: count layers per cell
+        let mut layer_counts = vec![0u32; total_cells];
+        for info in chunk_infos {
+            let cx = (info.world_min[0] / chunk_size).floor() as i32;
+            let cy = (info.world_min[1] / chunk_size).floor() as i32;
+            let cz = (info.world_min[2] / chunk_size).floor() as i32;
+
+            let gx = (cx - min_coord[0]) as u32;
+            let gy = (cy - min_coord[1]) as u32;
+            let gz = (cz - min_coord[2]) as u32;
+
+            let flat_idx = gx + gy * size_x + gz * size_x * size_y;
+            layer_counts[flat_idx as usize] += 1;
+        }
+
+        // Build descriptors with base indices
+        let mut descriptors = vec![LayerDescriptor { base_index: 0, layer_count: 0 }; total_cells];
+        let mut current_base = 0u32;
+        for i in 0..total_cells {
+            descriptors[i].base_index = current_base;
+            descriptors[i].layer_count = layer_counts[i];
+            current_base += layer_counts[i];
+        }
+
+        // Second pass: fill layer data
+        let mut layer_data = vec![0u32; current_base as usize];
+        let mut cell_indices = vec![0u32; total_cells]; // tracks position within each cell's data
 
         for (idx, info) in chunk_infos.iter().enumerate() {
             let cx = (info.world_min[0] / chunk_size).floor() as i32;
@@ -413,10 +479,12 @@ impl RenderResources {
             let gz = (cz - min_coord[2]) as u32;
 
             let flat_idx = gx + gy * size_x + gz * size_x * size_y;
-            grid[flat_idx as usize] = idx as u32;
+            let offset = descriptors[flat_idx as usize].base_index + cell_indices[flat_idx as usize];
+            layer_data[offset as usize] = idx as u32;
+            cell_indices[flat_idx as usize] += 1;
         }
 
-        (min_coord, [size_x, size_y, size_z], grid)
+        (min_coord, [size_x, size_y, size_z], descriptors, layer_data)
     }
 
     fn create_shadow_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
@@ -828,7 +896,8 @@ impl RenderResources {
 
     /// Load individual chunk octrees from disk (v3 format only - SVDAG pre-compressed)
     /// Only loads chunks within view_distance of center (0 = load all)
-    fn load_chunks_from_disk(world_path: &PathBuf, view_distance: f32) -> Vec<(disk_io::ChunkCoord, rktri::voxel::svo::Octree)> {
+    /// Returns (coord, octree, layer_id)
+    fn load_chunks_from_disk(world_path: &PathBuf, view_distance: f32) -> Vec<(disk_io::ChunkCoord, rktri::voxel::svo::Octree, u32)> {
         use serde_json::Value;
         use rktri::voxel::chunk::CHUNK_SIZE;
 
@@ -861,6 +930,7 @@ impl RenderResources {
         for layer in layers {
             let layer_name = layer["name"].as_str().unwrap_or("unknown");
             let layer_dir = layer["directory"].as_str().unwrap_or(layer_name);
+            let layer_id = layer["id"].as_u64().unwrap_or(0) as u32;
 
             // Skip non-terrain layers (e.g. grass masks are loaded separately)
             let chunk_list = match layer["chunks"].as_array() {
@@ -871,7 +941,16 @@ impl RenderResources {
                 }
             };
 
-            log::info!("Loading layer '{}': {} chunks", layer_name, chunk_list.len());
+            log::info!("Loading layer '{}' (id={}): {} chunks", layer_name, layer_id, chunk_list.len());
+            eprintln!("DEBUG: Loading layer '{}' id={}", layer_name, layer_id);
+
+            // Debug: print first few chunk coordinates
+            for (i, chunk_info) in chunk_list.iter().take(3).enumerate() {
+                let x = chunk_info["x"].as_i64().unwrap() as i32;
+                let y = chunk_info["y"].as_i64().unwrap() as i32;
+                let z = chunk_info["z"].as_i64().unwrap() as i32;
+                log::debug!("Layer {} chunk[{}]: ({},{},{})", layer_name, i, x, y, z);
+            }
 
             // Get world center from manifest (approximate)
             let world_center_x = manifest["size"].as_f64().unwrap_or(0.0) as f32 / 2.0;
@@ -899,8 +978,8 @@ impl RenderResources {
                     .join(layer_dir)
                     .join(format!("chunk_{}_{}_{}.rkc", x, y, z));
 
-                if let Some(chunk) = Self::load_chunk_file(&chunk_file, x, y, z) {
-                    result.push(chunk);
+                if let Some((coord, octree)) = Self::load_chunk_file(&chunk_file, x, y, z, layer_id) {
+                    result.push((coord, octree, layer_id));
                 }
             }
         }
@@ -909,7 +988,7 @@ impl RenderResources {
         result
     }
 
-    fn load_chunk_file(path: &std::path::Path, x: i32, y: i32, z: i32)
+    fn load_chunk_file(path: &std::path::Path, x: i32, y: i32, z: i32, layer_id: u32)
         -> Option<(disk_io::ChunkCoord, rktri::voxel::svo::Octree)>
     {
         if !path.exists() {
@@ -924,8 +1003,8 @@ impl RenderResources {
         let chunk = disk_io::decompress_svdag_chunk(&compressed)
             .expect(&format!("Failed to decompress SVDAG chunk: {}", path.display()));
 
-        log::info!("Loaded chunk ({},{},{}): {} nodes, {} bricks",
-            x, y, z, chunk.octree.node_count(), chunk.octree.brick_count());
+        log::info!("Loaded chunk ({},{},{}) layer={}: {} nodes, {} bricks",
+            x, y, z, layer_id, chunk.octree.node_count(), chunk.octree.brick_count());
 
         Some((disk_io::ChunkCoord::new(x, y, z), chunk.octree))
     }
@@ -977,8 +1056,25 @@ impl RenderResources {
     }
 }
 
+/// Debug info for a loaded chunk
+#[derive(Debug, Clone)]
+struct ChunkDebugInfo {
+    node_count: u32,
+    brick_count: u32,
+    world_min: [f32; 3],
+}
+
+/// Debug info for a chunk's grass mask
+#[derive(Debug, Clone)]
+struct GrassDebugInfo {
+    node_count: u32,
+}
+
 /// Shared state between the debug server and the render loop
 struct SharedDebugState {
+    // World path (set at startup, read by debug commands)
+    world_path: Option<std::path::PathBuf>,
+
     // Camera overrides (set by debug handler, consumed by render loop)
     camera_move_to: Option<glam::Vec3>,
     camera_look_at: Option<glam::Vec3>,
@@ -1076,6 +1172,10 @@ struct SharedDebugState {
     // Chunk geometry data for terrain height queries
     chunk_bounds: Vec<[f32; 4]>, // [world_min_x, world_min_y, world_min_z, root_size]
 
+    // Chunk info for GetChunkInfo (updated by render loop)
+    loaded_chunks: std::collections::HashMap<(i32, i32, i32), ChunkDebugInfo>,
+    loaded_chunks_grass: std::collections::HashMap<(i32, i32, i32), GrassDebugInfo>,
+
     // Current grass state (read-only, updated by render loop)
     current_grass_enabled: bool,
     current_grass_density: f32,
@@ -1092,6 +1192,7 @@ struct SharedDebugState {
 impl Default for SharedDebugState {
     fn default() -> Self {
         Self {
+            world_path: None,
             camera_move_to: None,
             camera_look_at: None,
             camera_move_relative: None,
@@ -1122,6 +1223,8 @@ impl Default for SharedDebugState {
                 leaf_opacity: 0.15,
             },
             chunk_bounds: Vec::new(),
+            loaded_chunks: std::collections::HashMap::new(),
+            loaded_chunks_grass: std::collections::HashMap::new(),
             chunk_count: 0,
             world_extent: 0.0,
             current_fps: 0.0,
@@ -1547,6 +1650,94 @@ impl rktri_debug::DebugHandler for AppDebugHandler {
                     hit,
                 })
             }
+
+            DebugCommand::GetWorldMetadata => {
+                let s = self.state.lock().unwrap();
+                let world_path = match &s.world_path {
+                    Some(p) => p,
+                    None => return DebugResponse::error("No world loaded"),
+                };
+                let manifest_path = world_path.join("manifest.json");
+                let manifest_data = match std::fs::read_to_string(&manifest_path) {
+                    Ok(d) => d,
+                    Err(e) => return DebugResponse::error(format!("Failed to read manifest: {}", e)),
+                };
+                let manifest: serde_json::Value = match serde_json::from_str(&manifest_data) {
+                    Ok(m) => m,
+                    Err(e) => return DebugResponse::error(format!("Failed to parse manifest: {}", e)),
+                };
+
+                let name = manifest["name"].as_str().unwrap_or("unknown").to_string();
+                let version = manifest["version"].as_u64().unwrap_or(0) as u32;
+                let seed = manifest["seed"].as_u64().unwrap_or(0) as u32;
+                let size = manifest["size"].as_f64().unwrap_or(0.0) as f32;
+                let chunk_size = manifest["chunk_size"].as_u64().unwrap_or(4) as u32;
+
+                let tp = &manifest["terrain_params"];
+                let terrain_params = rktri_debug::TerrainParamsMeta {
+                    scale: tp["scale"].as_f64().unwrap_or(150.0) as f32,
+                    height_scale: tp["height_scale"].as_f64().unwrap_or(80.0) as f32,
+                    octaves: tp["octaves"].as_u64().unwrap_or(5) as u32,
+                    persistence: tp["persistence"].as_f64().unwrap_or(0.5) as f32,
+                    lacunarity: tp["lacunarity"].as_f64().unwrap_or(2.0) as f32,
+                    sea_level: tp["sea_level"].as_f64().unwrap_or(20.0) as f32,
+                };
+
+                let mut layers = Vec::new();
+                if let Some(arr) = manifest["layers"].as_array() {
+                    for layer in arr {
+                        layers.push(rktri_debug::LayerMeta {
+                            name: layer["name"].as_str().unwrap_or("unknown").to_string(),
+                            id: layer["id"].as_u64().unwrap_or(0) as u32,
+                            directory: layer["directory"].as_str().unwrap_or("").to_string(),
+                            chunk_count: layer["chunk_count"].as_u64().unwrap_or(0) as u32,
+                            total_bytes: layer["total_bytes"].as_u64().unwrap_or(0),
+                        });
+                    }
+                }
+
+                DebugResponse::ok(ResponseData::WorldMetadata {
+                    name,
+                    version,
+                    seed,
+                    size,
+                    chunk_size,
+                    terrain_params,
+                    layers,
+                })
+            }
+
+            DebugCommand::GetChunkInfo { x, y, z } => {
+                let s = self.state.lock().unwrap();
+                let key = (x, y, z);
+
+                if let Some(chunk_info) = s.loaded_chunks.get(&key) {
+                    let has_grass = s.loaded_chunks_grass.contains_key(&key);
+                    let grass_nodes = s.loaded_chunks_grass.get(&key)
+                        .map(|g| g.node_count)
+                        .unwrap_or(0);
+
+                    DebugResponse::ok(ResponseData::ChunkInfo {
+                        x, y, z,
+                        loaded: true,
+                        node_count: chunk_info.node_count,
+                        brick_count: chunk_info.brick_count,
+                        world_min: Some(chunk_info.world_min),
+                        has_grass,
+                        grass_nodes,
+                    })
+                } else {
+                    DebugResponse::ok(ResponseData::ChunkInfo {
+                        x, y, z,
+                        loaded: false,
+                        node_count: 0,
+                        brick_count: 0,
+                        world_min: None,
+                        has_grass: false,
+                        grass_nodes: 0,
+                    })
+                }
+            }
         }
     }
 }
@@ -1965,6 +2156,10 @@ impl App {
             state.world_extent = res.world_extent;
             if state.chunk_bounds.is_empty() && !res.chunk_bounds.is_empty() {
                 state.chunk_bounds = res.chunk_bounds.clone();
+            }
+            if state.loaded_chunks.is_empty() && !res.loaded_chunks.is_empty() {
+                state.loaded_chunks = res.loaded_chunks.clone();
+                state.loaded_chunks_grass = res.loaded_chunks_grass.clone();
             }
         }
     }
@@ -2548,42 +2743,36 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Position camera at human head-height above terrain center for pre-generated worlds
+        // Position camera at highest terrain point (mountains) for pre-generated worlds
         if self.world_path.is_some() && !resources.chunk_bounds.is_empty() {
-            // Find world XZ center from chunk bounds
-            let mut min_x = f32::MAX;
-            let mut max_x = f32::MIN;
-            let mut min_z = f32::MAX;
-            let mut max_z = f32::MIN;
+            // Find the highest terrain point in loaded chunks
+            let mut highest_point: Option<([f32; 4])> = None;
             for b in &resources.chunk_bounds {
-                min_x = min_x.min(b[0]);
-                max_x = max_x.max(b[0] + b[3]);
-                min_z = min_z.min(b[2]);
-                max_z = max_z.max(b[2] + b[3]);
-            }
-            let center_x = (min_x + max_x) / 2.0;
-            let center_z = (min_z + max_z) / 2.0;
-
-            // Find terrain height at center (highest chunk top_y at this XZ)
-            let mut best_y = 0.0_f32;
-            for b in &resources.chunk_bounds {
-                if center_x >= b[0] && center_x < b[0] + b[3]
-                    && center_z >= b[2] && center_z < b[2] + b[3]
-                {
-                    best_y = best_y.max(b[1] + b[3]);
+                let chunk_top = b[1] + b[3];
+                match highest_point {
+                    None => highest_point = Some(*b),
+                    Some(high) if chunk_top > high[1] + high[3] => highest_point = Some(*b),
+                    _ => {}
                 }
             }
 
-            // ~1.7m above terrain (adult human head height)
-            let cam_pos = glam::Vec3::new(center_x, best_y + 1.7, center_z);
-            let look_target = cam_pos + glam::Vec3::new(5.0, -1.0, 5.0);
-            self.camera.position = cam_pos;
-            let forward = (look_target - cam_pos).normalize();
-            let right = forward.cross(glam::Vec3::Y).normalize();
-            let up = right.cross(forward);
-            self.camera.rotation = glam::Quat::from_mat3(&glam::Mat3::from_cols(right, up, -forward));
-            log::info!("Camera positioned at terrain center: ({:.1}, {:.1}, {:.1}), terrain_height={:.1}",
-                center_x, cam_pos.y, center_z, best_y);
+            if let Some(b) = highest_point {
+                // Spawn at center of highest chunk
+                let center_x = b[0] + b[3] / 2.0;
+                let center_z = b[2] + b[3] / 2.0;
+                let terrain_top = b[1] + b[3];
+
+                // ~1.7m above terrain (adult human head height)
+                let cam_pos = glam::Vec3::new(center_x, terrain_top + 1.7, center_z);
+                let look_target = cam_pos + glam::Vec3::new(10.0, -5.0, 10.0);
+                self.camera.position = cam_pos;
+                let forward = (look_target - cam_pos).normalize();
+                let right = forward.cross(glam::Vec3::Y).normalize();
+                let up = right.cross(forward);
+                self.camera.rotation = glam::Quat::from_mat3(&glam::Mat3::from_cols(right, up, -forward));
+                log::info!("Camera positioned at highest point: ({:.1}, {:.1}, {:.1}), terrain_top={:.1}",
+                    center_x, cam_pos.y, center_z, terrain_top);
+            }
         }
 
         self.window = Some(window);
@@ -2823,6 +3012,11 @@ fn main() {
 
     // Create shared debug state
     let debug_state = Arc::new(StdMutex::new(SharedDebugState::default()));
+    // Set world path for debug commands
+    {
+        let mut s = debug_state.lock().unwrap();
+        s.world_path = world_path.clone();
+    }
 
     // Start debug server in background thread with tokio runtime
     let debug_state_clone = debug_state.clone();

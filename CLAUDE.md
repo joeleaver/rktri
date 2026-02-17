@@ -2,6 +2,14 @@
 
 Voxel-based 3D game engine using SVO (Sparse Voxel Octree) raytracing.
 
+## Development Principles
+
+- **Never decide something is "too hard"** - when stuck, ask questions instead of taking shortcuts
+- **Don't simplify by making things worse** - fix properly or ask for guidance
+- **When stuck on a bug, investigate the code** - read and understand rather than guessing
+- **No reverting to known-broken workarounds** - if a fix breaks something, fix it properly
+- **When unsure, ask the user** - don't make unilateral decisions about scope
+
 ## Build & Test
 
 ```bash
@@ -101,6 +109,28 @@ Each layer directory is self-contained for independent streaming. The manifest i
 - **Chunk grid**: 3D DDA acceleration buffer for raymarching through chunk space
 - **SVDAG**: Shared brick deduplication (6-20x compression typical)
 - **Grass**: Volumetric Beer's law in `svo_trace.wgsl`, 80 march steps, 80m range, triggered on terrain materials 9/10/11
+- **Multi-layer rendering**: See "Multi-Layer Octree Rendering" section below
+
+### Multi-Layer Octree Rendering
+
+Layers remain as separate octrees in the GPU buffer. The raycaster checks all layers at each grid cell and returns the highest-priority hit.
+
+**Layer Priority:**
+| Layer | ID | Priority |
+|-------|-----|----------|
+| Terrain | 0 | Lowest |
+| Rocks | 2 | Medium |
+| Vegetation | 3 | Highest |
+
+**Chunk Grid Structure:**
+```
+chunk_grid[idx] -> LayerIndices { terrain: u32, rocks: u32, vegetation: u32 }
+// 0 = not present, non-zero = index into octree buffer
+```
+
+**Raycasting:** For each grid cell, check all non-zero layer indices, track closest hit by layer priority. Higher layer ID wins for overlapping voxels.
+
+**See `docs/multi-layer-architecture.md` for full details.
 
 ### Debug System
 

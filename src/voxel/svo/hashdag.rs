@@ -50,6 +50,18 @@ impl HashDag {
     pub fn from_octree(octree: &Octree) -> Self {
         let max_depth = octree.max_depth() as usize;
 
+        // Handle empty octrees (root node only, no bricks)
+        if octree.brick_count() == 0 {
+            return Self {
+                levels: (0..=max_depth).map(|_| HashMap::new()).collect(),
+                bricks: HashMap::new(),
+                root: 0,
+                root_size: octree.root_size(),
+                max_depth,
+                total_nodes: 0,
+            };
+        }
+
         // Initialize level storage
         let mut levels: Vec<HashMap<NodeHash, HashDagNode>> =
             (0..=max_depth).map(|_| HashMap::new()).collect();
@@ -151,6 +163,22 @@ impl HashDag {
         let mut children = Vec::new();
         let mut brick_hashes_vec = Vec::new();
 
+        // Handle terminal leaf (single brick, no children)
+        if node.is_terminal_leaf() {
+            // brick_offset is 1-indexed (0 is sentinel for empty)
+            let brick_hash = brick_hashes[node.brick_offset as usize - 1];
+            let hash = Self::hash_node(node.flags, &[], &[brick_hash as u64], node.lod_color, node.lod_material);
+            node_to_hash[node_idx as usize] = Some(hash);
+            levels[level as usize].insert(hash, HashDagNode {
+                flags: node.flags,
+                children: vec![],
+                brick_hashes: vec![brick_hash],
+                lod_color: node.lod_color,
+                lod_material: node.lod_material,
+            });
+            return hash;
+        }
+
         if valid_mask != 0 {
             let mut internal_count = 0u32;
             let mut leaf_count = 0u32;
@@ -163,7 +191,17 @@ impl HashDag {
 
                 if leaf_mask & child_mask != 0 {
                     // Leaf child - get brick hash
-                    let brick_idx = node.brick_offset + leaf_count;
+                    // brick_offset is 1-indexed in Octree (0 = empty), convert to 0-indexed for array
+                    if node.brick_offset == 0 {
+                        // No bricks in this octree - skip
+                        continue;
+                    }
+                    let brick_idx = node.brick_offset + leaf_count - 1;
+                    if brick_idx as usize >= brick_hashes.len() {
+                        log::error!("Brick index out of bounds: brick_offset={}, leaf_count={}, len={}",
+                            node.brick_offset, leaf_count, brick_hashes.len());
+                        continue;
+                    }
                     let brick_hash = brick_hashes[brick_idx as usize];
                     brick_hashes_vec.push(brick_hash);
                     leaf_count += 1;

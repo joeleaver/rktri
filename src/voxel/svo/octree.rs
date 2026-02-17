@@ -339,6 +339,11 @@ impl Octree {
             if leaf_mask & child_mask != 0 {
                 // Leaf node - iterate brick voxels
                 let brick_idx = node.brick_offset + leaf_count;
+                // Bounds check - skip if brick_idx is out of range
+                if brick_idx as usize >= self.bricks.len() {
+                    leaf_count += 1;
+                    continue;
+                }
                 let brick = &self.bricks[brick_idx as usize];
                 let voxel_size = size / 4.0; // Each brick voxel is size/4
 
@@ -370,6 +375,77 @@ impl Octree {
                 internal_count += 1;
             }
         }
+    }
+
+    /// Merge two octrees using boolean OR (union).
+    /// Uses voxel iteration to collect all non-empty voxels, then rebuilds.
+    pub fn merge_union(&self, other: &Octree) -> Octree {
+        use super::adaptive::AdaptiveOctreeBuilder;
+        use crate::voxel::voxel::Voxel;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let root_size = self.root_size();
+        let voxel_res = 128u32;
+        let voxel_size = root_size / voxel_res as f32;
+        let half = root_size / 2.0;
+
+        log::debug!("merge_union: self root_size={}, brick_count={}, other brick_count={}",
+            root_size, self.brick_count(), other.brick_count());
+
+        // Collect all non-empty voxels from both octrees
+        let mut voxel_map: HashMap<(u32, u32, u32), Voxel> = HashMap::new();
+
+        // Sample self
+        let mut self_voxels = 0;
+        self.iterate_voxels(|local_pos: Vec3, voxel: Voxel| {
+            self_voxels += 1;
+            let ix = ((local_pos.x + half) / voxel_size).round() as u32;
+            let iy = ((local_pos.y + half) / voxel_size).round() as u32;
+            let iz = ((local_pos.z + half) / voxel_size).round() as u32;
+            if ix < voxel_res && iy < voxel_res && iz < voxel_res {
+                voxel_map.entry((ix, iy, iz)).or_insert(voxel);
+            }
+        });
+
+        // Sample other
+        let mut other_voxels = 0;
+        other.iterate_voxels(|local_pos: Vec3, voxel: Voxel| {
+            other_voxels += 1;
+            let ix = ((local_pos.x + half) / voxel_size).round() as u32;
+            let iy = ((local_pos.y + half) / voxel_size).round() as u32;
+            let iz = ((local_pos.z + half) / voxel_size).round() as u32;
+            if ix < voxel_res && iy < voxel_res && iz < voxel_res {
+                voxel_map.entry((ix, iy, iz)).or_insert(voxel);
+            }
+        });
+
+        log::debug!("merge_union: iterate_voxels self={}, other={}, collected={}, brick_counts=({}, {})",
+            self_voxels, other_voxels, voxel_map.len(), self.brick_count(), other.brick_count());
+
+        if voxel_map.is_empty() {
+            return Octree::new(root_size, self.max_depth().max(other.max_depth()));
+        }
+
+        // Wrap voxel_map in Arc for the closure
+        let voxel_map = Arc::new(voxel_map);
+
+        // Build new octree from collected voxels
+        let builder = AdaptiveOctreeBuilder::new(voxel_res);
+        let origin = Vec3::new(-half, -half, -half);
+
+        let merged = builder.build_simple(
+            &|pos: Vec3| {
+                let ix = ((pos.x + half) / voxel_size).round() as u32;
+                let iy = ((pos.y + half) / voxel_size).round() as u32;
+                let iz = ((pos.z + half) / voxel_size).round() as u32;
+                voxel_map.get(&(ix, iy, iz)).copied().unwrap_or(Voxel::EMPTY)
+            },
+            origin,
+            root_size,
+        );
+
+        merged
     }
 }
 

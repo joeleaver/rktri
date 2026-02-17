@@ -102,6 +102,10 @@ pub enum DebugCommand {
     GetDlssState,
     /// Raycast straight down from (x, high_y, z) to find terrain height
     RaycastDown { x: f32, z: f32 },
+    /// Get world metadata from manifest.json
+    GetWorldMetadata,
+    /// Get info for a specific chunk (if loaded)
+    GetChunkInfo { x: i32, y: i32, z: i32 },
     /// Ping (health check)
     Ping,
 }
@@ -201,6 +205,26 @@ pub enum ResponseData {
         height: f32,
         hit: bool,
     },
+    WorldMetadata {
+        name: String,
+        version: u32,
+        seed: u32,
+        size: f32,
+        chunk_size: u32,
+        terrain_params: TerrainParamsMeta,
+        layers: Vec<LayerMeta>,
+    },
+    ChunkInfo {
+        x: i32,
+        y: i32,
+        z: i32,
+        loaded: bool,
+        node_count: u32,
+        brick_count: u32,
+        world_min: Option<[f32; 3]>,
+        has_grass: bool,
+        grass_nodes: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +250,25 @@ pub struct FpsWindowInfo {
     pub avg: f32,
     pub min: f32,
     pub max: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerrainParamsMeta {
+    pub scale: f32,
+    pub height_scale: f32,
+    pub octaves: u32,
+    pub persistence: f32,
+    pub lacunarity: f32,
+    pub sea_level: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerMeta {
+    pub name: String,
+    pub id: u32,
+    pub directory: String,
+    pub chunk_count: u32,
+    pub total_bytes: u64,
 }
 
 impl DebugResponse {

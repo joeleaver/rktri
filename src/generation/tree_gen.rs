@@ -1,38 +1,38 @@
-//! Rock noise generator — builds rock distribution mask per chunk.
+//! Tree noise generator — builds tree placement mask per chunk.
 //!
-//! Uses terrain height, slope, and biome to determine rock probability.
-//! Rocks spawn on surface, typically on slopes and exposed areas.
+//! Uses biome, terrain height, slope, and noise to determine tree probability.
+//! Trees spawn on surface in appropriate biomes (Forest, Grassland).
 
 use glam::Vec3;
 use crate::mask::{BiomeId, MaskGenerator, MaskHint, MaskOctree, MaskValue};
 use crate::math::Aabb;
 use crate::terrain::generator::TerrainGenerator;
 
-/// Rock probability cell: [0, 1] indicating rock probability.
-/// 0 = no rock, 1 = solid rock.
+/// Tree probability cell: [0, 1] indicating tree probability.
+/// 0 = no tree, 1 = solid tree location.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct RockCell(pub f32);
+pub struct TreeCell(pub f32);
 
-impl RockCell {
+impl TreeCell {
     pub const NONE: Self = Self(0.0);
     pub fn is_none(self) -> bool {
         self.0 <= 0.0
     }
 }
 
-impl MaskValue for RockCell {}
+impl MaskValue for TreeCell {}
 
-/// Procedural rock distribution generator.
+/// Procedural tree distribution generator.
 ///
-/// Evaluates terrain height, slope, and biome to assign rock probability.
-pub struct RockNoiseGenerator<'a> {
+/// Evaluates biome, terrain height, slope, and noise to assign tree probability.
+pub struct TreeNoiseGenerator<'a> {
     terrain: &'a TerrainGenerator,
     biome_mask: &'a MaskOctree<BiomeId>,
     chunk_origin: Vec3,
     seed: u32,
 }
 
-impl<'a> RockNoiseGenerator<'a> {
+impl<'a> TreeNoiseGenerator<'a> {
     pub fn new(
         terrain: &'a TerrainGenerator,
         biome_mask: &'a MaskOctree<BiomeId>,
@@ -81,11 +81,11 @@ impl<'a> RockNoiseGenerator<'a> {
         a + (b - a) * fz
     }
 
-    /// Multi-octave noise for rock distribution.
-    fn rock_noise(&self, x: f32, z: f32) -> f32 {
-        let n1 = self.smooth_noise(x, z, 8.0);
-        let n2 = self.smooth_noise(x + 100.0, z + 100.0, 4.0);
-        let n3 = self.smooth_noise(x + 200.0, z + 200.0, 2.0);
+    /// Multi-octave noise for tree distribution.
+    fn tree_noise(&self, x: f32, z: f32) -> f32 {
+        let n1 = self.smooth_noise(x, z, 10.0);
+        let n2 = self.smooth_noise(x + 100.0, z + 100.0, 5.0);
+        let n3 = self.smooth_noise(x + 200.0, z + 200.0, 2.5);
         n1 * 0.5 + n2 * 0.35 + n3 * 0.15
     }
 
@@ -102,51 +102,49 @@ impl<'a> RockNoiseGenerator<'a> {
         (dx * dx + dz * dz).sqrt()
     }
 
-    /// Evaluate rock probability at a world position.
-    fn evaluate_at(&self, x: f32, z: f32) -> RockCell {
+    /// Evaluate tree probability at a world position.
+    fn evaluate_at(&self, x: f32, z: f32) -> TreeCell {
         let height = self.terrain.height_at(x, z);
 
-        // Sample biome - note: local_pos should be in mask's local space
-        let local_pos = Vec3::new(x - self.chunk_origin.x, height - self.chunk_origin.y, z - self.chunk_origin.z);
-        let biome_id = self.biome_mask.sample(self.chunk_origin, local_pos);
+        // Sample biome
+        let biome_id = self.biome_mask.sample(self.chunk_origin, Vec3::new(x, height, z));
 
-        // Biomes that can have rocks: Mountains, Taiga, Tundra, Forest, Grassland
-        let (biome_has_rocks, rock_multiplier) = match biome_id {
-            BiomeId(7) => (true, 1.0),   // Mountains - max rocks
-            BiomeId(5) => (true, 0.7),   // Taiga
-            BiomeId(6) => (true, 0.6),   // Tundra
-            BiomeId(4) => (true, 0.4),   // Forest - fewer rocks
-            BiomeId(3) => (true, 0.5),   // Grassland - moderate rocks
+        // Biomes that can have trees: Forest, Grassland (both need trees)
+        // Forest has more trees, Grassland has fewer but we want more for this demo
+        let (biome_has_trees, tree_multiplier) = match biome_id {
+            BiomeId(4) => (true, 1.0),   // Forest - max trees
+            BiomeId(3) => (true, 0.8),   // Grassland - good tree coverage
             _ => (false, 0.0),
         };
 
-        if !biome_has_rocks {
-            return RockCell::NONE;
+        if !biome_has_trees {
+            return TreeCell::NONE;
         }
 
-        // Check slope - rocks more likely on steeper terrain
+        // Check slope - trees prefer gentle terrain
         let slope = self.slope_at(x, z);
-        let slope_factor = (slope / 2.0).min(1.0);
+        let slope_factor = 1.0 - (slope / 1.5).min(1.0); // Trees don't like steep slopes
 
-        // Base rock probability from noise
-        let noise = self.rock_noise(x, z);
+        // Base tree probability from noise
+        let noise = self.tree_noise(x, z);
 
-        // Rock threshold: steep slopes + high noise = rock
-        // Lower threshold for grassland (more rocks)
-        let base_threshold = if matches!(biome_id, BiomeId(3)) { 0.4 } else { 0.6 };
-        let threshold = base_threshold - slope_factor * 0.3; // Lower threshold on slopes
-        let rock_prob = if noise > threshold {
+        // Tree threshold: gentle slopes + high noise = tree
+        // Forest: higher density, Grassland: moderate density
+        let base_threshold = if matches!(biome_id, BiomeId(4)) { 0.55 } else { 0.5 };
+        let threshold = base_threshold - (1.0 - slope_factor) * 0.25; // Lower threshold on flat ground
+
+        let tree_prob = if noise > threshold {
             ((noise - threshold) / (1.0 - threshold)).min(1.0)
         } else {
             0.0
         };
 
-        RockCell(rock_prob * rock_multiplier)
+        TreeCell(tree_prob * tree_multiplier * slope_factor)
     }
 }
 
-impl<'a> MaskGenerator<RockCell> for RockNoiseGenerator<'a> {
-    fn classify_region(&self, aabb: &Aabb) -> MaskHint<RockCell> {
+impl<'a> MaskGenerator<TreeCell> for TreeNoiseGenerator<'a> {
+    fn classify_region(&self, aabb: &Aabb) -> MaskHint<TreeCell> {
         // Sample at XZ corners + center
         let samples = [
             (aabb.min.x, aabb.min.z),
@@ -156,7 +154,7 @@ impl<'a> MaskGenerator<RockCell> for RockNoiseGenerator<'a> {
             ((aabb.min.x + aabb.max.x) * 0.5, (aabb.min.z + aabb.max.z) * 0.5),
         ];
 
-        let mut first_cell: Option<RockCell> = None;
+        let mut first_cell: Option<TreeCell> = None;
         for (x, z) in samples {
             let cell = self.evaluate_at(x, z);
             match first_cell {
@@ -168,11 +166,11 @@ impl<'a> MaskGenerator<RockCell> for RockNoiseGenerator<'a> {
 
         match first_cell {
             Some(cell) => MaskHint::Uniform(cell),
-            None => MaskHint::Uniform(RockCell::NONE),
+            None => MaskHint::Uniform(TreeCell::NONE),
         }
     }
 
-    fn evaluate(&self, pos: Vec3) -> RockCell {
+    fn evaluate(&self, pos: Vec3) -> TreeCell {
         self.evaluate_at(pos.x, pos.z)
     }
 }
