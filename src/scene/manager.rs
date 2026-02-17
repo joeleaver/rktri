@@ -20,6 +20,7 @@ pub struct SceneManager {
     pipeline: GenerationPipeline,
     scene_graph: SceneGraph,
     terrain_node: SceneNodeId,
+    static_objects_node: SceneNodeId,
 }
 
 impl SceneManager {
@@ -36,12 +37,19 @@ impl SceneManager {
             LayerId::TERRAIN,
             NodeContent::ChunkedRegion { chunks: HashMap::new() },
         );
+        let static_objects_node = scene_graph.add_child(
+            root,
+            "static_objects",
+            LayerId::STATIC_OBJECTS,
+            NodeContent::Group,
+        );
 
         Self {
             config,
             pipeline,
             scene_graph,
             terrain_node,
+            static_objects_node,
         }
     }
 
@@ -57,6 +65,23 @@ impl SceneManager {
                 chunks.insert(coord, octree);
             }
         }
+    }
+
+    /// Add a voxel model instance (tree, rock, etc.) to the static objects layer.
+    /// The model will be positioned at the given world position.
+    pub fn add_voxel_instance(&mut self, name: impl Into<String>, octree: Octree, position: Vec3) {
+        let bounds = Vec3::splat(octree.root_size());
+        use super::node::LocalTransform;
+        let new_node_id = self.scene_graph.add_child(
+            self.static_objects_node,
+            name,
+            LayerId::STATIC_OBJECTS,
+            NodeContent::VoxelInstance {
+                model: std::sync::Arc::new(octree),
+                bounds,
+            },
+        );
+        self.scene_graph.set_transform(new_node_id, LocalTransform::from_position(position));
     }
 
     /// Generate chunks around a center position within view distance.

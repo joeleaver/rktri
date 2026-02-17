@@ -284,6 +284,7 @@ fn get_material_properties(material_id: u32) -> vec3<f32> {
         case 14u: { return vec3<f32>(0.8, 0.1, 0.0); }  // Snow terrain
         case 15u: { return vec3<f32>(0.95, 0.0, 0.0); } // Ocean floor
         case 16u: { return vec3<f32>(0.9, 0.0, 0.3); }  // Grass blade: rough, slight translucency
+        case 20u: { return vec3<f32>(0.95, 0.0, 0.0); }  // Rock: very rough, non-metallic
         default: { return vec3<f32>(0.5, 0.0, 0.0); }   // Default
     }
 }
@@ -460,6 +461,20 @@ fn decode_bark_normal(voxel: Voxel) -> vec3<f32> {
     return normalize(vec3<f32>(nx, ny, nz));
 }
 
+// Decode rock surface normal from RGB565-encoded gradient normal in voxel color field.
+// Rock voxels store the surface gradient normal (computed via central differences).
+// Same encoding as bark: R(5)=nx, G(6)=ny, B(5)=nz.
+fn decode_rock_normal(voxel: Voxel) -> vec3<f32> {
+    let encoded = voxel.data & 0xFFFFu;
+    let r5 = (encoded >> 11u) & 0x1Fu;
+    let g6 = (encoded >> 5u) & 0x3Fu;
+    let b5 = encoded & 0x1Fu;
+    let nx = f32(r5) / 31.0 * 2.0 - 1.0;
+    let ny = f32(g6) / 63.0 * 2.0 - 1.0;
+    let nz = f32(b5) / 31.0 * 2.0 - 1.0;
+    return normalize(vec3<f32>(nx, ny, nz));
+}
+
 // Compute box normal from hit point relative to voxel center
 fn compute_box_normal(hit_point: vec3<f32>, center: vec3<f32>, half_size: f32) -> vec3<f32> {
     let rel = (hit_point - center) / half_size;
@@ -602,6 +617,9 @@ fn trace_brick(
                                 // Decode cloud-center-to-point normal from color field
                                 final_normal = decode_bark_normal(voxel);
                             }
+                        } else if (material_id == 20u && flags > 0u) {
+                            // Rock: precise gradient normal from generator (SDF-based)
+                            final_normal = decode_rock_normal(voxel);
                         } else {
                             // Other tree materials: box normal
                             let center = voxel_min + vec3<f32>(voxel_size * 0.5);
@@ -1828,7 +1846,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let profile_idx = grass_cell & 0xFFu;
             let mask_density = f32((grass_cell >> 8u) & 0xFFu) / 255.0;
 
-            if (profile_idx > 0u && profile_idx < grass.profile_count && mask_density > 0.01) {
+            // Skip grass on rocks (material 20)
+            if (profile_idx > 0u && profile_idx < grass.profile_count && mask_density > 0.01 && hit.material_id != 20u) {
                 let slope_factor = smoothstep(0.15, 0.5, abs(hit.normal.y));
                 let profile = grass_profiles[profile_idx];
 
@@ -1851,9 +1870,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     }
                 }
 
-                // Ground tint: only for terrain pixels (not volumetric grass).
+                // Ground tint: only for terrain pixels (not volumetric grass, not rocks).
                 // Tints bare terrain in grassy areas for smooth distance transition.
-                if (hit.material_id != 16u) {
+                // Exclude rocks (material 20) - grass shouldn't grow on rocks.
+                if (hit.material_id != 16u && hit.material_id != 20u) {
                     let tint_fade = 1.0 - smoothstep(grass.fade_start, grass_tint_range, hit.t);
                     let tint_strength = slope_factor * mask_density * tint_fade * 0.4;
                     if (tint_strength > 0.01) {

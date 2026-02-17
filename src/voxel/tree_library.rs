@@ -49,6 +49,8 @@ fn style_from_str(s: &str) -> TreeStyle {
         "Oak" => TreeStyle::Oak,
         "Willow" => TreeStyle::Willow,
         "Elm" => TreeStyle::Elm,
+        "WinterOak" => TreeStyle::WinterOak,
+        "WinterWillow" => TreeStyle::WinterWillow,
         _ => TreeStyle::Oak,
     }
 }
@@ -58,6 +60,8 @@ fn style_to_str(style: TreeStyle) -> &'static str {
         TreeStyle::Oak => "Oak",
         TreeStyle::Willow => "Willow",
         TreeStyle::Elm => "Elm",
+        TreeStyle::WinterOak => "WinterOak",
+        TreeStyle::WinterWillow => "WinterWillow",
     }
 }
 
@@ -66,6 +70,8 @@ fn style_to_dir(style: TreeStyle) -> &'static str {
         TreeStyle::Oak => "oak",
         TreeStyle::Willow => "willow",
         TreeStyle::Elm => "elm",
+        TreeStyle::WinterOak => "winter_oak",
+        TreeStyle::WinterWillow => "winter_willow",
     }
 }
 

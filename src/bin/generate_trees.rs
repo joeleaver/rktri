@@ -79,8 +79,10 @@ fn parse_args() -> Result<Args, String> {
                     "oak" => Some(TreeStyle::Oak),
                     "willow" => Some(TreeStyle::Willow),
                     "elm" => Some(TreeStyle::Elm),
+                    "winter_oak" => Some(TreeStyle::WinterOak),
+                    "winter_willow" => Some(TreeStyle::WinterWillow),
                     "all" => None,
-                    other => return Err(format!("Unknown style: {}. Valid styles: oak, willow, elm, all", other)),
+                    other => return Err(format!("Unknown style: {}. Valid styles: oak, willow, elm, winter_oak, winter_willow, all", other)),
                 };
             }
             "-n" | "--count" => {
@@ -148,6 +150,8 @@ fn generate_trees_for_style(
         TreeStyle::Oak => "oak",
         TreeStyle::Willow => "willow",
         TreeStyle::Elm => "elm",
+        TreeStyle::WinterOak => "winter_oak",
+        TreeStyle::WinterWillow => "winter_willow",
     };
 
     println!("Generating {} {} trees...", count, style_name);
@@ -211,6 +215,8 @@ fn main() {
             TreeStyle::Oak,
             TreeStyle::Willow,
             TreeStyle::Elm,
+            TreeStyle::WinterOak,
+            TreeStyle::WinterWillow,
         ],
     };
 

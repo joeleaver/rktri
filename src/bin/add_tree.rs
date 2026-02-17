@@ -1,6 +1,8 @@
-//! Add a single tree to an existing world for visual testing.
+//! Add one or more trees to an existing world for visual testing.
 //!
-//! Usage: cargo run --release --bin add_tree -- --world grass_test
+//! Usage:
+//!   cargo run --release --bin add_tree -- --world grass_test
+//!   cargo run --release --bin add_tree -- --world forest_world --count 50 --radius 50
 
 use glam::Vec3;
 
@@ -15,12 +17,56 @@ use rktri::streaming::disk_io;
 
 use std::path::PathBuf;
 
+/// Simple LCG random number generator for reproducibility
+struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next(&mut self) -> u64 {
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.state
+    }
+
+    fn gen_f32(&mut self) -> f32 {
+        (self.next() >> 32) as f32 / u32::MAX as f32
+    }
+
+    fn gen_range(&mut self, range: std::ops::Range<usize>) -> usize {
+        (self.gen_f32() * range.len() as f32) as usize + range.start
+    }
+}
+
+const TREE_STYLES: &[TreeStyle] = &[
+    TreeStyle::Oak,
+    TreeStyle::Willow,
+    TreeStyle::Elm,
+    TreeStyle::WinterOak,
+    TreeStyle::WinterWillow,
+];
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let world_name = args.iter()
         .position(|a| a == "--world")
         .and_then(|i| args.get(i + 1))
-        .expect("Usage: add_tree --world <name>");
+        .expect("Usage: add_tree --world <name> [--count N] [--radius R]");
+
+    let count = args.iter()
+        .position(|a| a == "--count")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    let radius = args.iter()
+        .position(|a| a == "--radius")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50.0);
 
     let world_dir = PathBuf::from(format!("assets/worlds/{}", world_name));
     let manifest_path = world_dir.join("manifest.json");
@@ -48,40 +94,70 @@ fn main() {
         terrain_params,
         biome_mask_depth: 3,
         grass_mask_depth: 5,
+        clutter_mask_depth: 4,
     };
     let pipeline = GenerationPipeline::new(&config);
 
-    // Place tree ~12m ahead of camera start position (camera starts at world center looking NE)
     let size = manifest["size"].as_f64().unwrap_or(200.0) as f32;
     let center = size / 2.0;
-    let tree_x = center + 10.0;
-    let tree_z = center + 10.0;
-    let terrain_height = pipeline.height_at(tree_x, tree_z);
-    let tree_pos = Vec3::new(tree_x, terrain_height, tree_z);
 
-    println!("=== Adding Oak tree to world '{}' ===", world_name);
-    println!("Tree position: ({:.1}, {:.1}, {:.1})", tree_pos.x, tree_pos.y, tree_pos.z);
-    println!("Terrain height: {:.1}m", terrain_height);
+    // Generate random tree positions
+    let mut rng = SimpleRng::new(12345);
+    let mut tree_positions: Vec<(Vec3, TreeStyle)> = Vec::with_capacity(count);
 
-    // Generate tree with updated generator (encodes SDF flags)
-    let mut tree_gen = TreeGenerator::from_style(42, TreeStyle::Oak);
-    let tree_octree = tree_gen.generate(16.0, 7);
-    println!("Tree: {} nodes, {} bricks", tree_octree.node_count(), tree_octree.brick_count());
+    println!("=== Adding {} trees to world '{}' ===", count, world_name);
 
-    let tree_instance = TreeInstance::new(tree_octree, tree_pos);
-    let tree_aabb = tree_instance.world_aabb();
-    println!("Tree AABB: ({:.1},{:.1},{:.1}) -> ({:.1},{:.1},{:.1})",
-        tree_aabb.min.x, tree_aabb.min.y, tree_aabb.min.z,
-        tree_aabb.max.x, tree_aabb.max.y, tree_aabb.max.z);
+    for i in 0..count {
+        // Random position within radius around center
+        let angle = rng.gen_f32() * std::f32::consts::TAU;
+        let dist = rng.gen_f32() * radius;
+        let tree_x = center + angle.cos() * dist;
+        let tree_z = center + angle.sin() * dist;
 
-    // Find affected chunks
+        let terrain_height = pipeline.height_at(tree_x, tree_z);
+        let tree_pos = Vec3::new(tree_x, terrain_height, tree_z);
+
+        // Pick random tree style
+        let style = TREE_STYLES[rng.gen_range(0..TREE_STYLES.len())];
+
+        if i < 5 || count <= 10 {
+            println!("Tree {}: style={:?}, pos=({:.1}, {:.1}, {:.1})", i, style, tree_pos.x, tree_pos.y, tree_pos.z);
+        } else if i == 5 {
+            println!("  ... ({} more trees)", count - 5);
+        }
+
+        tree_positions.push((tree_pos, style));
+    }
+
+    // Collect all tree AABBs to determine affected chunks
+    let mut tree_instances: Vec<TreeInstance> = Vec::with_capacity(count);
+    let mut combined_min = Vec3::splat(f32::MAX);
+    let mut combined_max = Vec3::splat(f32::MIN);
+
+    for (tree_pos, style) in &tree_positions {
+        let mut tree_gen = TreeGenerator::from_style(42, *style);
+        let tree_octree = tree_gen.generate(16.0, 7);
+        let tree_instance = TreeInstance::new(tree_octree, *tree_pos);
+        let tree_aabb = tree_instance.world_aabb();
+
+        combined_min = combined_min.min(tree_aabb.min);
+        combined_max = combined_max.max(tree_aabb.max);
+
+        tree_instances.push(tree_instance);
+    }
+
+    println!("Combined AABB: ({:.1},{:.1},{:.1}) -> ({:.1},{:.1},{:.1})",
+        combined_min.x, combined_min.y, combined_min.z,
+        combined_max.x, combined_max.y, combined_max.z);
+
+    // Find affected chunks from combined AABB
     let chunk_f = CHUNK_SIZE as f32;
-    let min_cx = (tree_aabb.min.x / chunk_f).floor() as i32;
-    let max_cx = (tree_aabb.max.x / chunk_f).floor() as i32;
-    let min_cy = (tree_aabb.min.y / chunk_f).floor() as i32;
-    let max_cy = (tree_aabb.max.y / chunk_f).floor() as i32;
-    let min_cz = (tree_aabb.min.z / chunk_f).floor() as i32;
-    let max_cz = (tree_aabb.max.z / chunk_f).floor() as i32;
+    let min_cx = (combined_min.x / chunk_f).floor() as i32;
+    let max_cx = (combined_max.x / chunk_f).floor() as i32;
+    let min_cy = (combined_min.y / chunk_f).floor() as i32;
+    let max_cy = (combined_max.y / chunk_f).floor() as i32;
+    let min_cz = (combined_min.z / chunk_f).floor() as i32;
+    let max_cz = (combined_max.z / chunk_f).floor() as i32;
 
     println!("Affected chunks: x={}..{}, y={}..{}, z={}..{}",
         min_cx, max_cx, min_cy, max_cy, min_cz, max_cz);
@@ -114,15 +190,29 @@ fn main() {
                 let terrain_classifier = MaskDrivenTerrainClassifier::new(
                     pipeline.terrain(), &biome_mask, origin, voxel_size);
 
-                // Wrap with tree
+                // Wrap with all trees
                 let mut tree_classifier = MultiTreeClassifier::new(&terrain_classifier);
-                tree_classifier.add_tree(tree_instance.clone());
+                for tree_instance in &tree_instances {
+                    // Check if tree AABB overlaps this chunk before adding
+                    let tree_aabb = tree_instance.world_aabb();
+                    let chunk_min = origin;
+                    let chunk_max = origin + Vec3::splat(chunk_f);
+
+                    let overlaps = tree_aabb.min.x < chunk_max.x && tree_aabb.max.x > chunk_min.x
+                        && tree_aabb.min.y < chunk_max.y && tree_aabb.max.y > chunk_min.y
+                        && tree_aabb.min.z < chunk_max.z && tree_aabb.max.z > chunk_min.z;
+
+                    if overlaps {
+                        tree_classifier.add_tree(tree_instance.clone());
+                    }
+                }
 
                 // Build chunk octree
                 let builder = AdaptiveOctreeBuilder::new(128);
                 let octree = builder.build(&tree_classifier, origin, chunk_f);
 
-                if octree.brick_count() == 0 {
+                let node_count = octree.node_count();
+                if node_count == 0 {
                     continue;
                 }
 
@@ -141,9 +231,9 @@ fn main() {
                     new_chunks.push((cx, cy, cz));
                 }
 
-                println!("  {} chunk ({},{},{}) - {} bytes",
+                println!("  {} chunk ({},{},{}) - {} nodes, {} bytes",
                     if is_new { "NEW" } else { "UPD" },
-                    cx, cy, cz, compressed.len());
+                    cx, cy, cz, node_count, compressed.len());
                 chunks_written += 1;
             }
         }
