@@ -4,19 +4,23 @@
 //! 1. Biome mask construction (MaskOctree<BiomeId>)
 //! 2. Terrain octree building (via MaskDrivenTerrainClassifier)
 //! 3. Grass mask construction (MaskOctree<GrassCell>)
+//! 4. Clutter mask construction (MaskOctree<ClutterCell>)
 
 pub mod config;
 pub mod biome_gen;
 pub mod terrain_gen;
 pub mod grass_gen;
+pub mod clutter_gen;
 
 pub use config::GenerationConfig;
 pub use biome_gen::BiomeNoiseGenerator;
 pub use terrain_gen::MaskDrivenTerrainClassifier;
 pub use grass_gen::GrassNoiseGenerator;
+pub use clutter_gen::ClutterNoiseGenerator;
 
 use glam::Vec3;
 use rayon::prelude::*;
+use crate::clutter::profile::{ClutterCell, ClutterProfileTable};
 use crate::grass::profile::{GrassCell, GrassProfileTable};
 use crate::mask::{MaskBuilder, MaskOctree};
 use crate::terrain::biome::BiomeMap;
@@ -24,20 +28,23 @@ use crate::terrain::generator::TerrainGenerator;
 use crate::voxel::chunk::{Chunk, ChunkCoord, CHUNK_SIZE};
 use crate::voxel::svo::adaptive::AdaptiveOctreeBuilder;
 
-/// Result of generating a single chunk: terrain octree + grass mask.
+/// Result of generating a single chunk: terrain octree + grass mask + clutter mask.
 pub struct GeneratedChunk {
     pub chunk: Chunk,
     pub grass_mask: MaskOctree<GrassCell>,
+    pub clutter_mask: MaskOctree<ClutterCell>,
 }
 
-/// Orchestrates chunk generation: biome mask → terrain octree → grass mask.
+/// Orchestrates chunk generation: biome mask → terrain octree → grass mask → clutter mask.
 pub struct GenerationPipeline {
     terrain: TerrainGenerator,
     biome_map: BiomeMap,
     biome_mask_depth: u8,
     grass_mask_depth: u8,
+    clutter_mask_depth: u8,
     sea_level: f32,
-    profile_table: GrassProfileTable,
+    grass_profile_table: GrassProfileTable,
+    clutter_profile_table: ClutterProfileTable,
     seed: u32,
 }
 
@@ -52,8 +59,10 @@ impl GenerationPipeline {
             biome_map,
             biome_mask_depth: config.biome_mask_depth,
             grass_mask_depth: config.grass_mask_depth,
+            clutter_mask_depth: config.clutter_mask_depth,
             sea_level: config.terrain_params.sea_level,
-            profile_table: GrassProfileTable::default(),
+            grass_profile_table: GrassProfileTable::default(),
+            clutter_profile_table: ClutterProfileTable::default(),
             seed: config.seed,
         }
     }
@@ -65,7 +74,7 @@ impl GenerationPipeline {
         self.generate_chunk_with_grass(coord).chunk
     }
 
-    /// Generate a single chunk with biome-aware terrain and grass mask.
+    /// Generate a single chunk with biome-aware terrain, grass mask, and clutter mask.
     pub fn generate_chunk_with_grass(&self, coord: ChunkCoord) -> GeneratedChunk {
         let origin = coord.world_origin();
         let chunk_size = CHUNK_SIZE as f32;
@@ -89,15 +98,22 @@ impl GenerationPipeline {
 
         // 3. Build grass mask from biome mask + slope
         let grass_gen = GrassNoiseGenerator::new(
-            &self.terrain, &biome_mask, origin, &self.profile_table, self.seed,
+            &self.terrain, &biome_mask, origin, &self.grass_profile_table, self.seed,
         );
         let grass_mask = MaskBuilder::new(self.grass_mask_depth)
             .build(&grass_gen, origin, chunk_size);
 
+        // 4. Build clutter mask from biome + terrain properties
+        let clutter_gen = ClutterNoiseGenerator::new(
+            &self.terrain, &biome_mask, origin, &self.clutter_profile_table, self.seed,
+        );
+        let clutter_mask = MaskBuilder::new(self.clutter_mask_depth)
+            .build(&clutter_gen, origin, chunk_size);
+
         let mut chunk = Chunk::from_octree(coord, octree);
         chunk.modified = true;
 
-        GeneratedChunk { chunk, grass_mask }
+        GeneratedChunk { chunk, grass_mask, clutter_mask }
     }
 
     /// Get terrain height at a world position (delegates to TerrainGenerator).
@@ -115,9 +131,14 @@ impl GenerationPipeline {
         &self.biome_map
     }
 
-    /// Get a reference to the profile table.
-    pub fn profile_table(&self) -> &GrassProfileTable {
-        &self.profile_table
+    /// Get a reference to the grass profile table.
+    pub fn grass_profile_table(&self) -> &GrassProfileTable {
+        &self.grass_profile_table
+    }
+
+    /// Get a reference to the clutter profile table.
+    pub fn clutter_profile_table(&self) -> &ClutterProfileTable {
+        &self.clutter_profile_table
     }
 
     /// Generate chunks around a center position, skipping already-existing coords.
@@ -264,6 +285,7 @@ mod tests {
             },
             biome_mask_depth: 3,
             grass_mask_depth: 5,
+            clutter_mask_depth: 4,
         }
     }
 
@@ -297,6 +319,8 @@ mod tests {
         assert!(generated.chunk.modified);
         // Grass mask should exist (even if empty)
         assert!(generated.grass_mask.node_count() >= 1);
+        // Clutter mask should exist (even if empty)
+        assert!(generated.clutter_mask.node_count() >= 1);
     }
 
     #[test]
@@ -339,6 +363,7 @@ mod tests {
             },
             biome_mask_depth: 3,
             grass_mask_depth: 5,
+            clutter_mask_depth: 4,
         };
         let pipeline = GenerationPipeline::new(&config);
 

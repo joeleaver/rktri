@@ -7,6 +7,7 @@ use crate::mask::{BiomeId, MaskOctree};
 use crate::terrain::biome::Biome;
 use crate::terrain::generator::TerrainGenerator;
 use crate::voxel::svo::classifier::{RegionClassifier, RegionHint};
+use crate::voxel::sdf::{encode_gradient, GRADIENT_RANGE};
 use crate::voxel::voxel::Voxel;
 
 /// Terrain classifier that reads biome data from a pre-built mask octree.
@@ -78,25 +79,28 @@ impl<'a> RegionClassifier for MaskDrivenTerrainClassifier<'a> {
         let biome = Biome::from_id(biome_id);
         let base = biome.surface_color();
 
-        // Compute terrain gradient via finite differences for smooth normals.
+        // Compute gradient via finite differences for smooth shading.
+        // Uses the SDF module's gradient range constant.
         let eps = self.voxel_size;
         let dh_dx = (self.terrain.height_at(pos.x + eps, pos.z)
                    - self.terrain.height_at(pos.x - eps, pos.z)) / (2.0 * eps);
         let dh_dz = (self.terrain.height_at(pos.x, pos.z + eps)
                    - self.terrain.height_at(pos.x, pos.z - eps)) / (2.0 * eps);
 
-        // Encode gradient in color field: each maps [-4, 4] → [0, 255]
-        let dx_enc = (((dh_dx + 4.0) / 8.0).clamp(0.0, 1.0) * 255.0) as u8;
-        let dz_enc = (((dh_dz + 4.0) / 8.0).clamp(0.0, 1.0) * 255.0) as u8;
-        let gradient_color = (dz_enc as u16) << 8 | dx_enc as u16;
+        // Clamp gradient to valid range for encoding
+        let dh_dx_clamped = dh_dx.clamp(-GRADIENT_RANGE, GRADIENT_RANGE);
+        let dh_dz_clamped = dh_dz.clamp(-GRADIENT_RANGE, GRADIENT_RANGE);
 
-        // Height fraction in flags byte (1-255)
+        // Encode gradient in color field
+        let color = encode_gradient(dh_dx_clamped, dh_dz_clamped);
+
+        // Store height fraction in flags for sub-voxel refinement
         let voxel_bottom = pos.y - self.voxel_size * 0.5;
         let h_frac = ((height - voxel_bottom) / self.voxel_size).clamp(0.0, 1.0);
         let flags = ((h_frac * 254.0) as u8).max(1);
 
         Voxel {
-            color: gradient_color,
+            color,
             material_id: base.material_id,
             flags,
         }
