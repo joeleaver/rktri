@@ -11,12 +11,14 @@ pub mod biome_gen;
 pub mod terrain_gen;
 pub mod grass_gen;
 pub mod clutter_gen;
+pub mod clutter_to_layer;
 
 pub use config::GenerationConfig;
 pub use biome_gen::BiomeNoiseGenerator;
 pub use terrain_gen::MaskDrivenTerrainClassifier;
 pub use grass_gen::GrassNoiseGenerator;
 pub use clutter_gen::ClutterNoiseGenerator;
+pub use clutter_to_layer::{ClutterLayerConfig, ClutterToLayerConverter, LayerOctrees};
 
 use glam::Vec3;
 use rayon::prelude::*;
@@ -33,9 +35,12 @@ pub struct GeneratedChunk {
     pub chunk: Chunk,
     pub grass_mask: MaskOctree<GrassCell>,
     pub clutter_mask: MaskOctree<ClutterCell>,
+    /// Layer octrees (rocks, vegetation) converted from clutter
+    pub layer_octrees: LayerOctrees,
 }
 
-/// Orchestrates chunk generation: biome mask → terrain octree → grass mask → clutter mask.
+
+/// Orchestrates chunk generation: biome mask → terrain octree → grass mask → clutter mask → layers.
 pub struct GenerationPipeline {
     terrain: TerrainGenerator,
     biome_map: BiomeMap,
@@ -45,6 +50,7 @@ pub struct GenerationPipeline {
     sea_level: f32,
     grass_profile_table: GrassProfileTable,
     clutter_profile_table: ClutterProfileTable,
+    clutter_converter: ClutterToLayerConverter,
     seed: u32,
 }
 
@@ -53,6 +59,10 @@ impl GenerationPipeline {
     pub fn new(config: &GenerationConfig) -> Self {
         let terrain = TerrainGenerator::new(config.terrain_params.clone());
         let biome_map = BiomeMap::new(config.seed);
+        let clutter_converter = ClutterToLayerConverter::new(
+            crate::generation::clutter_to_layer::ClutterLayerConfig::default(),
+            config.seed,
+        );
 
         Self {
             terrain,
@@ -63,6 +73,7 @@ impl GenerationPipeline {
             sea_level: config.terrain_params.sea_level,
             grass_profile_table: GrassProfileTable::default(),
             clutter_profile_table: ClutterProfileTable::default(),
+            clutter_converter,
             seed: config.seed,
         }
     }
@@ -110,10 +121,18 @@ impl GenerationPipeline {
         let clutter_mask = MaskBuilder::new(self.clutter_mask_depth)
             .build(&clutter_gen, origin, chunk_size);
 
+        // 5. Convert clutter to rock/vegetation layer octrees
+        let terrain_octree = Chunk::from_octree(coord, octree.clone()).octree;
+        let layer_octrees = self.clutter_converter.convert(
+            &clutter_mask,
+            origin,
+            &terrain_octree,
+        );
+
         let mut chunk = Chunk::from_octree(coord, octree);
         chunk.modified = true;
 
-        GeneratedChunk { chunk, grass_mask, clutter_mask }
+        GeneratedChunk { chunk, grass_mask, clutter_mask, layer_octrees }
     }
 
     /// Get terrain height at a world position (delegates to TerrainGenerator).

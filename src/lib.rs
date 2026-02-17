@@ -14,3 +14,4 @@ pub mod atmosphere;
 pub mod grass;
 pub mod mask;
 pub mod generation;
+pub mod clutter;

@@ -177,7 +177,7 @@ impl ViewerState {
 
         // Upload single-chunk grid
         let chunk_indices = [0u32];
-        octree_buffer.upload_chunk_grid(device, queue, &chunk_indices);
+        octree_buffer.upload_chunk_grid(device, queue, &[], &chunk_indices);
 
         // Single chunk at origin
         let chunk_count = 1;
@@ -307,7 +307,7 @@ impl ViewerState {
         };
         self.octree_buffer.update_chunk_infos(queue, &[chunk_info]);
         let chunk_indices = [0u32];
-        self.octree_buffer.upload_chunk_grid(device, queue, &chunk_indices);
+        self.octree_buffer.upload_chunk_grid(device, queue, &[], &chunk_indices);
 
         // Recreate SVO pipeline with new buffer
         self.svo_pipeline = SvoTracePipeline::new(device, &self.camera_buffer, &self.octree_buffer);
@@ -745,7 +745,6 @@ impl ApplicationHandler for App {
             &mut encoder,
             &view,
             &state.display_bind_group,
-            Some(clear_color),
             None,
         );
 

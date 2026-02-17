@@ -116,14 +116,22 @@ fn main() {
     // Phase 2: Generate terrain + grass layers
     let terrain_dir = output_dir.join("terrain");
     let grass_dir = output_dir.join("grass");
+    let rocks_dir = output_dir.join("rocks");
+    let vegetation_dir = output_dir.join("vegetation");
     std::fs::create_dir_all(&terrain_dir).expect("Failed to create terrain directory");
     std::fs::create_dir_all(&grass_dir).expect("Failed to create grass directory");
+    std::fs::create_dir_all(&rocks_dir).expect("Failed to create rocks directory");
+    std::fs::create_dir_all(&vegetation_dir).expect("Failed to create vegetation directory");
 
     let start = Instant::now();
     let generated = AtomicUsize::new(0);
     let total_terrain_bytes = AtomicUsize::new(0);
     let total_grass_bytes = AtomicUsize::new(0);
+    let total_rocks_bytes = AtomicUsize::new(0);
+    let total_vegetation_bytes = AtomicUsize::new(0);
     let grass_chunk_count = AtomicUsize::new(0);
+    let rocks_chunk_count = AtomicUsize::new(0);
+    let vegetation_chunk_count = AtomicUsize::new(0);
 
     let terrain_chunks: Vec<(i32, i32, i32)> = coords
         .par_iter()
@@ -165,6 +173,32 @@ fn main() {
                 grass_chunk_count.fetch_add(1, Ordering::Relaxed);
             }
 
+            // Write rocks layer (layer_id = 2)
+            if result.layer_octrees.rocks_octree.brick_count() > 0 {
+                let rocks_octree = result.layer_octrees.rocks_octree;
+                let rocks_disk_chunk = disk_io::Chunk::from_octree(disk_coord, rocks_octree);
+                let rocks_compressed = disk_io::compress_chunk(&rocks_disk_chunk)
+                    .expect("Failed to compress rocks chunk");
+                let rocks_file = rocks_dir.join(format!("chunk_{}_{}_{}.rkc", coord.x, coord.y, coord.z));
+                total_rocks_bytes.fetch_add(rocks_compressed.len(), Ordering::Relaxed);
+                std::fs::write(&rocks_file, &rocks_compressed)
+                    .expect("Failed to write rocks chunk file");
+                rocks_chunk_count.fetch_add(1, Ordering::Relaxed);
+            }
+
+            // Write vegetation layer (layer_id = 3)
+            if result.layer_octrees.vegetation_octree.brick_count() > 0 {
+                let veg_octree = result.layer_octrees.vegetation_octree;
+                let veg_disk_chunk = disk_io::Chunk::from_octree(disk_coord, veg_octree);
+                let veg_compressed = disk_io::compress_chunk(&veg_disk_chunk)
+                    .expect("Failed to compress vegetation chunk");
+                let veg_file = vegetation_dir.join(format!("chunk_{}_{}_{}.rkc", coord.x, coord.y, coord.z));
+                total_vegetation_bytes.fetch_add(veg_compressed.len(), Ordering::Relaxed);
+                std::fs::write(&veg_file, &veg_compressed)
+                    .expect("Failed to write vegetation chunk file");
+                vegetation_chunk_count.fetch_add(1, Ordering::Relaxed);
+            }
+
             Some((coord.x, coord.y, coord.z))
         })
         .collect();
@@ -172,7 +206,11 @@ fn main() {
     let elapsed = start.elapsed();
     let terrain_bytes = total_terrain_bytes.load(Ordering::Relaxed);
     let grass_bytes = total_grass_bytes.load(Ordering::Relaxed);
+    let rocks_bytes = total_rocks_bytes.load(Ordering::Relaxed);
+    let vegetation_bytes = total_vegetation_bytes.load(Ordering::Relaxed);
     let grass_count = grass_chunk_count.load(Ordering::Relaxed);
+    let rocks_count = rocks_chunk_count.load(Ordering::Relaxed);
+    let vegetation_count = vegetation_chunk_count.load(Ordering::Relaxed);
 
     println!();
     println!("Terrain: {} chunks in {:.1}s ({:.0} chunks/sec, {:.1} MB)",
@@ -181,6 +219,10 @@ fn main() {
         terrain_bytes as f64 / (1024.0 * 1024.0));
     println!("Grass:   {} chunks with masks ({:.1} KB)",
         grass_count, grass_bytes as f64 / 1024.0);
+    println!("Rocks:   {} chunks ({:.1} KB)",
+        rocks_count, rocks_bytes as f64 / 1024.0);
+    println!("Vegetation: {} chunks ({:.1} KB)",
+        vegetation_count, vegetation_bytes as f64 / 1024.0);
 
     // Phase 3: Write manifest with per-layer structure
     let mut y_groups: BTreeMap<i32, usize> = BTreeMap::new();
@@ -190,7 +232,7 @@ fn main() {
 
     let manifest = json!({
         "name": name,
-        "version": 2,
+        "version": 3,
         "seed": seed,
         "size": size,
         "chunk_size": CHUNK_SIZE,
@@ -220,6 +262,22 @@ fn main() {
                 "directory": "grass",
                 "chunk_count": grass_count,
                 "total_bytes": grass_bytes,
+            },
+            {
+                "name": "rocks",
+                "id": 2,
+                "directory": "rocks",
+                "chunk_count": rocks_count,
+                "total_bytes": rocks_bytes,
+                "chunks": read_chunk_coords(&rocks_dir),
+            },
+            {
+                "name": "vegetation",
+                "id": 3,
+                "directory": "vegetation",
+                "chunk_count": vegetation_count,
+                "total_bytes": vegetation_bytes,
+                "chunks": read_chunk_coords(&vegetation_dir),
             }
         ],
     });
@@ -230,16 +288,48 @@ fn main() {
 
     println!();
     println!("=== Generation Complete ===");
-    println!("Layers: 2 (terrain, grass)");
+    println!("Layers: 4 (terrain, grass, rocks, vegetation)");
     println!("Chunks: {} with geometry (of {} candidates)", terrain_chunks.len(), total);
     println!("Grass:  {} chunks with masks", grass_count);
-    println!("Size:   {:.1} MB terrain + {:.1} KB grass on disk",
+    println!("Rocks:  {} chunks with rocks", rocks_count);
+    println!("Vegetation: {} chunks", vegetation_count);
+    println!("Size:   {:.1} MB terrain + {:.1} KB grass + {:.1} KB rocks + {:.1} KB vegetation",
         terrain_bytes as f64 / (1024.0 * 1024.0),
-        grass_bytes as f64 / 1024.0);
+        grass_bytes as f64 / 1024.0,
+        rocks_bytes as f64 / 1024.0,
+        vegetation_bytes as f64 / 1024.0);
     println!("Output: {}", output_dir.display());
     println!();
     println!("To load this world:");
     println!("  cargo run --release --bin rktri -- --world {}", name);
+}
+
+/// Read chunk coordinates from a directory (e.g., rocks/, vegetation/)
+fn read_chunk_coords(dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+    entries
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let filename = e.file_name();
+            let name = filename.to_str()?;
+            if name.starts_with("chunk_") && name.ends_with(".rkc") {
+                let coords: Vec<_> = name.strip_prefix("chunk_")
+                    .and_then(|s| s.strip_suffix(".rkc"))
+                    .map(|s| s.split('_').collect::<Vec<_>>())?;
+                if coords.len() == 3 {
+                    return Some(json!({
+                        "x": coords[0].parse::<i32>().unwrap_or(0),
+                        "y": coords[1].parse::<i32>().unwrap_or(0),
+                        "z": coords[2].parse::<i32>().unwrap_or(0),
+                    }));
+                }
+            }
+            None
+        })
+        .collect()
 }
 
 fn parse_f32_arg(args: &[String], flag: &str) -> Option<f32> {
